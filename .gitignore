@@ -10,3 +10,8 @@ figures/*.png.tmp
 
 # IDE
 .idea/workspace.xml
+
+# 本地缓存（沙箱环境）
+.mplconfig/
+.uv-cache/
+.tmp/
