@@ -137,6 +137,17 @@ def verify_outputs(report_path: Path) -> None:
         print(f"    figures/{name}：{width}×{height} px，{size_kb:.0f} KB")
         assert size_kb > 100, f"{name} 只有 {size_kb:.1f} KB（要求 > 100 KB）"
 
+    # [4b] 可缩放交互地图
+    html_path = FIG_DIR / "global_sst_map.html"
+    assert html_path.exists(), f"缺少 {html_path}"
+    html_text = html_path.read_text(encoding="utf-8", errors="ignore")
+    html_mb = html_path.stat().st_size / 1e6
+    lowered = html_text.lower()
+    for marker in ("<canvas", "int16", "sst_jan", "sst_jul"):
+        assert marker in lowered, f"交互地图缺少标记 {marker}"
+    print(f"    figures/global_sst_map.html：{html_mb:.1f} MB（canvas + int16 内嵌，离线可用）")
+    assert 2.0 < html_mb < 15.0, f"交互地图体积 {html_mb:.1f} MB 异常"
+
     # [5] summary_metrics
     summary = json.loads(SUMMARY_JSON.read_text(encoding="utf-8"))
     value = summary["basins"]["global"]["mean_sst_cos_weighted"]
@@ -206,6 +217,7 @@ def main() -> int:
         ["--region", "global", "--raw-dir", str(raw_dir)],
     )
     timings["绘图"] = run_step("绘制 6 张正式图", "plot.py")
+    timings["交互图"] = run_step("生成可缩放交互地图（HTML）", "make_map_viewer.py")
     timings["复核"] = run_step(
         "独立复核（60 时次 raw + ERDDAP 在线抽样）",
         "verify.py",
