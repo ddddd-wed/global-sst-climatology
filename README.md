@@ -41,8 +41,8 @@
 │   ├── zonal_mean_global.csv     # 720 行全球纬向平均（数据侧产出，入库）
 │   ├── zonal_mean_basins.csv     # global + 五大洋纵向堆叠（数据侧产出，入库）
 │   ├── climatology_grid.npz      # 720×1440 月气候态网格（数据侧产出，入库）
-│   ├── basin_mask.npz            # 可选：海盆编号网格 / 边界
-│   ├── summary_metrics.json      # 可选：各海盆 cosφ 加权均温等汇总
+│   ├── basin_mask.npz            # 可选：lat/lon/basin_names/basin_mask(uint8)/basin_id(int8)
+│   ├── summary_metrics.json      # 可选：basins.<name>.mean_sst_cos_weighted 等汇总
 │   ├── zonal_mean.csv            # 旧印度洋结果（281 行，回归基准，入库）
 │   └── verify_report.json        # verify.py 生成的复核报告（不入库）
 ├── figures/
@@ -74,11 +74,15 @@
 
 | 文件 | 内容 |
 | --- | --- |
-| `data/zonal_mean_global.csv` | 720 行（-89.875…89.875，0.25°），18 列：`latitude, valid_count, coverage, sst_annual, sst_jan, sst_jul, sst_01…sst_12`；`coverage = valid_count / 1440` |
-| `data/zonal_mean_basins.csv` | 首列 `basin`（`global/indian/pacific/atlantic/arctic/southern`，容忍大小写），后接同样 18 列；多海盆**纵向堆叠**在同一文件；可选 `ocean_grid_count` 与 `coverage_01…coverage_12` |
+| `data/zonal_mean_global.csv` | 720 行（-89.875…89.875，0.25°）；旧 18 列 `latitude, valid_count, coverage, sst_annual, sst_jan, sst_jul, sst_01…sst_12` + `ocean_grid_count` + `cov_01…cov_12` + `zonal_ocean_frac`。**`coverage = valid_count / ocean_grid_count`**（有数据比例），`zonal_ocean_frac = valid_count / 1440`（海洋占比） |
+| `data/zonal_mean_basins.csv` | 首列 `basin`，取值固定为 `global/pacific/atlantic/indian/arctic/southern`（容忍大小写），后接旧 18 列 + `ocean_grid_count` + `cov_01…cov_12`；多海盆**纵向堆叠**；`coverage = valid_count / ocean_grid_count` |
 | `data/climatology_grid.npz` | 键 `lat`(720)、`lon`(1440)、`sst_annual`(720×1440)、`sst_01…sst_12`（同形）；`NaN` = 陆地/海冰 |
-| `data/basin_mask.npz` | 可选：`basin_id`(720×1440) 或边界折线；不存在时地图不画海盆边界并在图注说明 |
-| `data/summary_metrics.json` | 可选：各海盆 cosφ 加权均温等；字段名不固定，读不到就由 CSV 现算 |
+| `data/basin_mask.npz` | 可选但建议：`lat`、`lon`、`basin_names`、`basin_mask`(uint8，0=陆地，1..5=pacific/atlantic/indian/arctic/southern)、`basin_id`(int8，-1=陆地)；不存在时地图不画海盆边界并在图注说明 |
+| `data/summary_metrics.json` | 可选：`basins.<name>.{mean_sst_cos_weighted, weighting:"cos(lat)*valid_count", valid_lat_min, valid_lat_max, isotherms}` 与 `coverage_definition`；字段缺失时由 CSV 现算 |
+
+> 新列一律「存在则用、缺失则降级」：`coverage`、`zonal_ocean_frac`、`cov_MM`、`ocean_grid_count`
+> 缺失时分别退回旧口径（`valid_count/1440`、`valid_count/1440`、跳过 NaN 模式检查、按 1440 分母）。
+> 全陆地/无海洋格点的纬度 `coverage` 为 `NaN`（或 0）；某月无有效海洋格点时 `cov_MM` 与 `sst_MM` 同为 `NaN`。
 
 `data/verify_report.json` 由 `verify.py` 生成（结构见第 7 节），是可复现的复核产物，默认不入库。
 
@@ -88,18 +92,29 @@
    不降采样、不重采样、不平滑。
 2. **纬向平均**：同一纬度圈内，对所有有效（非 `NaN`）海洋格点取**算术平均**；
    **不乘 cosφ**（同一纬度圈上各格点面积相同）。cosφ 仅用于跨纬度求海盆/全球平均。
-3. **有效格点数与覆盖率**：`valid_count` 是该纬度 60 个时次有效格点数的平均值（0–1440）；
-   全球文件 `coverage = valid_count / 1440`。分海盆文件若提供 `ocean_grid_count`，
-   则分盆 `coverage = valid_count / ocean_grid_count`（分母是该纬度该海盆的海洋格点数）。
+3. **两个比例必须区分**：
+   - **覆盖率 `coverage = valid_count / ocean_grid_count`**：该纬圈「有数据」的海洋格点比例
+     （非海冰/非缺测），只用于覆盖率副图展示；
+   - **海洋占比 `zonal_ocean_frac = valid_count / 1440`**：该纬圈有效海洋格点占**整圈**的比例，
+     是「曲线是否绘制」的唯一门槛。分海盆文件没有该列，用 `valid_count / 1440` 现算。
 4. **时间维度**：逐时次求纬向平均 → 同一月份 5 个年份取平均，得到 12 个月气候态 →
    12 个月**等权**平均得到年均。
-5. **绘图阈值**：只绘制 `coverage ≥ 10%` 的纬度段。阈值写成可配置常量 `DEFAULT_COVERAGE_MIN`
-   （`scripts/plot.py`），可用 `--coverage-min` 或环境变量 `SST_COVERAGE_MIN` 覆盖。
+5. **绘图阈值**：只绘制 **海洋占比 `zonal_ocean_frac ≥ 10%`** 的纬度段。阈值写成可配置常量
+   `DEFAULT_COVERAGE_MIN`（`scripts/plot.py`），可用 `--coverage-min` 或环境变量 `SST_COVERAGE_MIN` 覆盖。
+   **不能用 `coverage` 当门槛**：窄海盆/极区 `coverage` 可能很高，但整圈只有几十个海洋格点，
+   拿它画曲线会得到看似正常、实则以偏概全的结果。
 6. **季节反相**：北半球 1 月冷、7 月暖，南半球相反；`verify.py` 用 20°–60° 纬度带的 cosφ 加权均值
    检查这一符号关系。
 7. **体积处理**：60 个时次未压缩约 2.75 GB，因此原始响应以 **gzip 无损压缩**保存为
    `data/raw/sst_YYYY_MM.csv.gz`（落盘约 250 MB），解压后与 ERDDAP 返回逐字节一致；
    计算时直接读取 gz，数据本身未裁剪或降采样。
+
+两个比例的定义与用途对照：
+
+| 名称 | 公式 | 分母 | 用途 |
+| --- | --- | --- | --- |
+| 覆盖率 `coverage` | `valid_count / ocean_grid_count` | 该纬圈该海盆的**海洋格点数** | 副图展示冰情/缺测；**不作绘图门槛** |
+| 海洋占比 `zonal_ocean_frac` | `valid_count / 1440` | 该纬圈**整圈经度格点数** | 决定曲线是否绘制（≥10%）；分盆文件用 `valid_count/1440` 现算 |
 
 ## 5. 复现步骤
 
@@ -137,21 +152,21 @@
 
 | 图 | 内容 |
 | --- | --- |
-| `global_sst_vs_latitude.png` | 90°S–90°N 年均 / 1 月 / 7 月曲线 + 右侧覆盖率面板；年均 **25 °C 等温线的南北半球交点同时标注**（旧版 `find_isotherm(...)[-1]` 只取最后一个，会漏掉北半球）；覆盖率 < 10% 的纬度灰底不画 |
-| `basins_sst_vs_latitude.png` | 五大洋分盆年均曲线 + 旧印度洋结果（灰色点划线）对照；右面板为 1 月（实线）/ 7 月（虚线），展示南北半球季节反相 |
-| `global_sst_map.png` | 0.25° 全球年均 SST 等经纬（Plate Carrée）地图，色标固定 −2～32 °C，叠加 25 °C 等值线；有 `basin_mask.npz` 时叠加近似海盆边界。**未引入 cartopy**，图注中说明投影 |
-| `lat_month_heatmap.png` | 全球 12 个月 × 纬度热图，黑色等值线 25 °C，灰色为覆盖率不足的纬度 |
+| `global_sst_vs_latitude.png` | 90°S–90°N 年均 / 1 月 / 7 月曲线 + 右侧双比例面板（蓝=海洋占比 `valid/1440`，橙=有数据比例 `valid/ocean_grid_count`）；年均 **25 °C 等温线的南北半球交点同时标注**；海洋占比 < 10% 的纬度灰底不画 |
+| `basins_sst_vs_latitude.png` | 五大洋分盆年均曲线 + 旧印度洋结果（灰色点划线）对照；门槛用 `valid_count/1440` 现算；右面板为 1 月（实线）/ 7 月（虚线），展示南北半球季节反相 |
+| `global_sst_map.png` | 0.25° 全球年均 SST 等经纬（Plate Carrée）地图，色标固定 −2～32 °C，叠加 25 °C 等值线与 `basin_mask.npz` 海盆边界。**未引入 cartopy**，图注中说明投影 |
+| `lat_month_heatmap.png` | 全球 12 个月 × 纬度热图，黑色等值线 25 °C，灰色为海洋占比不足的纬度 |
 | `indian_vs_global.png` | 印度洋旧廓线 vs 全球廓线，副图为「印度洋 − 全球」差值（仅重叠纬度、有效值处） |
 
 当前 `figures/dev/` 中 fixture 自测图的实测尺寸/体积（单图均 < 2 MB）：
 
 | 文件 | 像素 | 体积 |
 | --- | --- | --- |
-| `global_sst_vs_latitude.png` | 2404 × 1457 | 353 KB |
-| `basins_sst_vs_latitude.png` | 2876 × 1421 | 446 KB |
-| `global_sst_map.png` | 2376 × 1187 | 324 KB |
-| `lat_month_heatmap.png` | 2482 × 1318 | 210 KB |
-| `indian_vs_global.png` | 2364 × 1630 | 245 KB |
+| `global_sst_vs_latitude.png` | 2404 × 1457 | 364 KB |
+| `basins_sst_vs_latitude.png` | 3227 × 1421 | 417 KB |
+| `global_sst_map.png` | 2376 × 1187 | 293 KB |
+| `lat_month_heatmap.png` | 2482 × 1318 | 217 KB |
+| `indian_vs_global.png` | 2364 × 1630 | 249 KB |
 
 > 以上尺寸来自合成 fixture；真实数据到位后正式图可能因数值范围略有变化。图中红字水印表明合成数据身份。
 
@@ -162,10 +177,12 @@
 1. **数值复算**：读取 `data/raw/` 的 60 个 `csv.gz`，独立重算「逐时次纬向平均 → 同月多年平均 →
    12 月等权年均」，抽 **8 个纬度（-70/-45/-20/0/20/40/60/75°）× 1 月、7 月** 与
    `zonal_mean_basins.csv` 的 `global` 行对齐，容差 **0.01 °C**；年均同纬度一并比对。
-2. **结构性检查**：720 行、0.25° 步长、纬度单调、`coverage ∈ [0,1]`、`valid_count` 与 `coverage`
-   自洽、海洋值不超出 −2～35 °C、1 月/7 月南北半球季节反相、分海盆行数与 global 行一致性。
-3. **网格一致性**：`climatology_grid.npz` 键/形状齐全；只在「60 个时次全为海洋」的纬度比较
-   网格纬向平均与 CSV，避免冰缘处「先平均后平均」的固有差异被误判。
+2. **结构性检查**：720 行、0.25° 步长、纬度单调；新增列自洽——
+   `coverage ≈ valid_count / ocean_grid_count`、`zonal_ocean_frac ≈ valid_count / 1440`、
+   `cov_MM` 与 `sst_MM` 同 NaN 模式（均容差 **0.002**）；海洋值不超出 −2～35 °C、
+   1 月/7 月南北半球季节反相、分海盆行数与 global 行一致性。新列缺失时退回旧口径（`coverage≈valid/1440`）。
+3. **网格一致性**：`climatology_grid.npz` 键/形状齐全；只在「该纬圈所有海洋格点在 60 个时次都有数据」
+   （`coverage==1`）的纬度比较网格纬向平均与 CSV，避免冰缘处「先平均后平均」的固有差异被误判。
 4. **在线抽样**：直接向 ERDDAP 取 2–3 个时次 × 约 1° 窄带（很小的请求），与本地同一时次 raw
    逐纬圈比对，容差 **0.05 °C**；网络不通时输出「跳过在线复核」，**不算失败**。
 5. **印度洋回归**：用 `data/zonal_mean.csv` 复算旧 README 的三个关键数字。
@@ -185,8 +202,10 @@
 ```
 
 fixture 自测：`verify.py --data-dir .tmp/fixture --skip-online` →
-`pass_with_skips（通过 4 / 失败 0 / 跳过 2）`，退出码 0。
-单元测试 7 项（等温线双交点、印度洋回归、raw 重算往返、60 时次全流程、覆盖率自洽/破坏检测）全部通过。
+`pass_with_skips（通过 4 / 失败 0 / 跳过 2）`，退出码 0；结构性检查覆盖
+`coverage = valid/ocean_grid_count`、`zonal_ocean_frac = valid/1440`、`cov_MM`/`sst_MM` NaN 模式。
+单元测试 11 项（等温线双交点、印度洋回归、raw 重算往返、60 时次全流程、覆盖率/海洋占比/NaN 模式
+自洽与破坏检测）全部通过。
 
 ## 8. 关键结果（待真实数据填入）
 
@@ -195,20 +214,23 @@ fixture 自测：`verify.py --data-dir .tmp/fixture --skip-online` →
 
 - 全球年均 SST 最高值及所在纬度：待填
 - 年均 25 °C 等温线（北半球 / 南半球）：待填
-- 五大洋 cosφ 加权年均 SST：待填
-- 覆盖率最低的纬度及数值（10% 阈值附近）：待填
+- 五大洋 cos(lat)*valid_count 加权年均 SST：待填
+- 海洋占比最低的纬度及数值（10% 门槛附近，勿与 coverage 混淆）：待填
 - 1 月 / 7 月季节振幅随纬度变化：待填
 
 ## 9. 已知局限
 
-- **10% 覆盖率阈值与极地海冰**：北冰洋冬季、南大洋高纬在 60 个时次平均后有效格点可能低于 10%，
-  这些纬度不绘制；阈值附近结果对阈值敏感。
-- **海盆边界是近似划分**：印度洋 20°E–120°E、太平洋 120°E–280°E、其余归大西洋，66°N 以北为北冰洋、
-  60°S 以南为南大洋；与正式海盆定义存在差异，分盆均温只用于量级对比。
+- **10% 海洋占比阈值与极地海冰**：北冰洋冬季、南大洋高纬在 60 个时次平均后有效海洋格点可能低于 10%，
+  这些纬度不绘制；阈值附近结果对阈值敏感。注意这里用的是 `zonal_ocean_frac = valid_count/1440`，
+  不是 `coverage`（有数据比例）。
+- **海盆边界是近似划分**：印度洋 20°E–120°E、太平洋 120°E–280°E，其余归大西洋，66°N 以北为北冰洋、
+  60°S 以南为南大洋；与正式海盆定义存在差异，分盆均温只用于量级对比。`basin_mask.npz` 的海盆边界
+  只用于地图示意。
 - **每月只取 16 日一个时次**：不能代表整月平均，也不反映 MJO、季节内振荡；5 年气候态仍受 ENSO/IOD 影响。
 - **0.25°（约 28 km）分辨率**无法解析近岸、海峡和海湾；OISST 近岸为插值/掩膜结果，存在不确定性。
 - **纬向平均抹平经向差异**：不能替代阿拉伯海、孟加拉湾、副热带环流等区域分析。
-- **权重**：纬向平均不乘 cosφ；只有跨纬度求海盆/全球平均时才用 cosφ 面积权重，两者不可混用。
+- **权重**：纬向平均不乘 cosφ；跨纬度求海盆/全球平均时按 `cos(lat)*valid_count` 加权（与
+  `summary_metrics.json` 的 `weighting` 一致），两者不可混用。
 - **年均是 12 个月等权平均**（不按每月天数加权）。
 - **未做趋势分析或显著性检验**，结论仅描述 2016–2020 年气候态。
 - **fixture 不是观测**：`make_fixture.py` 用解析公式合成赤道暖、两极冷、季节反相、陆地 NaN、
@@ -238,6 +260,8 @@ fixture 自测：`verify.py --data-dir .tmp/fixture --skip-online` →
 
 旧口径：0.25° 原生格点 **401 列 × 281 行**（20.125–120.125°E、-39.875–30.125°N），
 `coverage = valid_count / 401`，12 个月等权年均，覆盖率 < 10% 不绘制。
+注意：旧文件早于新契约，这里的 `coverage` 实际等于 `valid_count/401`（即海洋占比），
+不是新定义的「有数据比例」；回归校验按旧语义执行，因此数字保持不变。
 
 旧关键结果（与 `data/zonal_mean.csv` 和 `scripts/compute.py` 输出一致）：
 

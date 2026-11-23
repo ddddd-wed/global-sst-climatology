@@ -17,7 +17,9 @@
 合成数据只用于开发自测，图上会打「合成数据」水印，绝不会写入 ``data/``。
 
 统计口径与数据侧一致：0.25° 原生格点、同纬圈非 NaN 海洋格点算术平均（不乘 cosφ）、
-12 个月等权得年均、``coverage = valid_count / 1440``、覆盖率 < 10% 的纬度不绘制。
+12 个月等权得年均。**绘图门槛用「海洋占比」``zonal_ocean_frac = valid_count / 1440`` ≥ 10%**；
+``coverage = valid_count / ocean_grid_count`` 是「有数据比例」（非海冰/非缺测），只用于覆盖率
+副图展示，不能拿来决定是否画曲线（否则窄海盆/极区会拿几十个格点画出看似正常的曲线）。
 """
 
 from __future__ import annotations
@@ -59,9 +61,10 @@ MASK_NPZ = DATA_DIR / "basin_mask.npz"
 SUMMARY_JSON = DATA_DIR / "summary_metrics.json"
 INDIAN_CSV = DATA_DIR / "zonal_mean.csv"
 
-# 覆盖率阈值：可配置常量（也支持 --coverage-min / 环境变量 SST_COVERAGE_MIN）
+# 绘图门槛：海洋占比阈值（可配置常量，也支持 --coverage-min / 环境变量 SST_COVERAGE_MIN）
 DEFAULT_COVERAGE_MIN = float(os.environ.get("SST_COVERAGE_MIN", "0.10"))
-N_LON_GLOBAL = 1440          # 0.25° 全球经度格点数，coverage 的分母
+N_LON_GLOBAL = 1440          # 0.25° 全球经度格点数，zonal_ocean_frac 的分母
+N_LON_INDIAN = 401           # 旧印度洋文件 0.25° 经度格点数，仅用于旧结果回归
 LAT_MIN, LAT_MAX = -90.0, 90.0
 ISOTHERM_LEVEL = 25.0
 DPI = 200
@@ -193,11 +196,64 @@ def isotherm_crossings(lat: np.ndarray, sst: np.ndarray, level: float = ISOTHERM
     return deduped
 
 
-def basin_mean_cos(lat: np.ndarray, sst: np.ndarray, coverage: np.ndarray, cov_min: float) -> float | None:
-    usable = np.isfinite(sst) & (coverage >= cov_min)
+def zonal_ocean_fraction(frame: pd.DataFrame, n_lon: int = N_LON_GLOBAL) -> np.ndarray:
+    """绘图门槛用的「海洋占比」：优先 zonal_ocean_frac，其次 valid_count/n_lon，最后退回 coverage。"""
+    if "zonal_ocean_frac" in frame:
+        return frame["zonal_ocean_frac"].to_numpy(dtype=float)
+    if "valid_count" in frame:
+        return frame["valid_count"].to_numpy(dtype=float) / n_lon
+    return frame_coverage(frame)
+
+
+def frame_coverage(frame: pd.DataFrame) -> np.ndarray:
+    """「有数据比例」coverage：分母 ocean_grid_count；旧文件缺失该列时退回 valid_count/1440。
+
+    注意：coverage 只用于覆盖率副图展示，**不能**作为是否绘制曲线的门槛。
+    """
+    if "coverage" in frame:
+        return frame["coverage"].to_numpy(dtype=float)
+    if "ocean_grid_count" in frame and "valid_count" in frame:
+        ocean = frame["ocean_grid_count"].to_numpy(dtype=float)
+        valid = frame["valid_count"].to_numpy(dtype=float)
+        out = np.full(len(frame), np.nan, dtype=float)
+        ok = ocean > 0
+        out[ok] = valid[ok] / ocean[ok]
+        return out
+    if "valid_count" in frame:
+        return frame["valid_count"].to_numpy(dtype=float) / N_LON_GLOBAL
+    return np.full(len(frame), np.nan, dtype=float)
+
+
+def coverage_ok(frame: pd.DataFrame, cov_min: float, n_lon: int = N_LON_GLOBAL) -> np.ndarray:
+    """曲线是否绘制：看海洋占比（valid/n_lon），不看 coverage（冰情/缺测比例）。"""
+    frac = zonal_ocean_fraction(frame, n_lon)
+    return np.isfinite(frac) & (frac >= cov_min)
+
+
+def cos_weighted_mean(
+    lat: np.ndarray, sst: np.ndarray, ocean_frac: np.ndarray, cov_min: float
+) -> float | None:
+    """cosφ 加权均温（旧印度洋回归口径，仅用于旧结果，保持 26.16 °C 不变）。"""
+    usable = np.isfinite(sst) & np.isfinite(ocean_frac) & (ocean_frac >= cov_min)
     if not usable.any():
         return None
     weights = np.cos(np.deg2rad(lat[usable]))
+    return float(np.sum(weights * sst[usable]) / np.sum(weights))
+
+
+def valid_weighted_mean(frame: pd.DataFrame, cov_min: float, n_lon: int = N_LON_GLOBAL) -> float | None:
+    """新契约的 cos(lat)*valid_count 加权均温；缺 valid_count 时降级为 cosφ 加权。"""
+    lat = frame["latitude"].to_numpy(dtype=float)
+    sst = frame["sst_annual"].to_numpy(dtype=float)
+    ocean_frac = zonal_ocean_fraction(frame, n_lon)
+    usable = np.isfinite(sst) & np.isfinite(ocean_frac) & (ocean_frac >= cov_min)
+    if not usable.any():
+        return None
+    weights = np.cos(np.deg2rad(lat[usable]))
+    if "valid_count" in frame:
+        weights = weights * np.maximum(frame["valid_count"].to_numpy(dtype=float)[usable], 0.0)
+    if float(np.sum(weights)) <= 0:
+        return None
     return float(np.sum(weights * sst[usable]) / np.sum(weights))
 
 
@@ -223,7 +279,7 @@ def shaded_bad_latitudes(ax: plt.Axes, lat: np.ndarray, bad: np.ndarray, cov_min
             y1 + 0.125,
             color="0.90",
             zorder=0,
-            label=(f"覆盖率 < {cov_min:.0%}（不绘制）" if label and not shaded else None),
+            label=(f"海洋占比 < {cov_min:.0%}（不绘制）" if label and not shaded else None),
         )
         shaded = True
 
@@ -273,20 +329,6 @@ def load_summary_means(path: Path) -> dict[str, float]:
         if value is not None and np.isfinite(value):
             out[str(name).strip().lower()] = value
     return out
-
-
-def coverage_ok(frame: pd.DataFrame, cov_min: float) -> np.ndarray:
-    if "coverage" in frame:
-        cov = frame["coverage"].to_numpy(dtype=float)
-    else:
-        cov = frame["valid_count"].to_numpy(dtype=float) / N_LON_GLOBAL
-    return np.isfinite(cov) & (cov >= cov_min)
-
-
-def frame_coverage(frame: pd.DataFrame) -> np.ndarray:
-    if "coverage" in frame:
-        return frame["coverage"].to_numpy(dtype=float)
-    return frame["valid_count"].to_numpy(dtype=float) / N_LON_GLOBAL
 
 
 # --------------------------------------------------------------------------- #
@@ -346,8 +388,9 @@ def plot_global_profile(ctx: dict, cov_min: float) -> Path:
     df = pd.read_csv(ctx["global_csv"])
     lat = df["latitude"].to_numpy(dtype=float)
     coverage = frame_coverage(df)
+    ocean_frac = zonal_ocean_fraction(df)
     annual = df["sst_annual"].to_numpy(dtype=float)
-    usable = np.isfinite(annual) & (coverage >= cov_min)
+    usable = np.isfinite(annual) & np.isfinite(ocean_frac) & (ocean_frac >= cov_min)
 
     fig = plt.figure(figsize=(12.0, 7.6))
     gs = fig.add_gridspec(1, 2, width_ratios=[4.4, 1.05], wspace=0.06)
@@ -416,35 +459,29 @@ def plot_global_profile(ctx: dict, cov_min: float) -> Path:
     subtitle = "合成数据（fixture）" if ctx["synthetic"] else "2016–2020 气候态，0.25° 原生格点"
     ax.set_title(f"全球纬向平均海表温度随纬度变化\n（{subtitle}，90°S–90°N）", fontsize=13)
 
-    # 覆盖率面板（分母固定 1440）
-    axc.fill_betweenx(lat, 0, coverage * 100, color="#7FA6C9", alpha=0.55, lw=0)
-    axc.plot(coverage * 100, lat, color="#2E6DB4", lw=1.3, zorder=3)
+    # 覆盖率面板：蓝=海洋占比（绘图门槛），橙=有数据比例（冰情/缺测，仅展示）
+    axc.fill_betweenx(lat, 0, ocean_frac * 100, color="#7FA6C9", alpha=0.55, lw=0)
+    axc.plot(ocean_frac * 100, lat, color="#2E6DB4", lw=1.3, zorder=3)
+    axc.plot(coverage * 100, lat, color="#E67E22", lw=1.3, ls="--", zorder=4)
     axc.axvline(cov_min * 100, color="#C0392B", ls="--", lw=1.1)
     axc.set_xlim(0, 100)
     axc.set_xticks([0, 50, 100])
     axc.tick_params(axis="x", labelsize=9)
-    axc.set_xlabel("覆盖率（%）", fontsize=9)
-    axc.set_title("有效海洋格点\n覆盖率", fontsize=10, pad=8)
+    axc.set_xlabel("比例（%）", fontsize=9)
+    axc.set_title(f"海洋占比（蓝，/{N_LON_GLOBAL}）\n有数据比例（橙，/ocean_grid_count）", fontsize=7.6, pad=8)
     axc.grid(True, axis="x", ls=":", lw=0.8, alpha=0.55)
     axc.set_axisbelow(True)
     plt.setp(axc.get_yticklabels(), visible=False)
-
-    eq = np.abs(lat) <= 1.0
-    axc.annotate(
-        f"赤道附近\n{coverage[eq].mean() * 100:.1f}%",
-        xy=(max(coverage[eq].mean() * 100, 2), 0.0),
-        xytext=(38, 14),
-        fontsize=8,
-        color="#8E2F2F",
-        arrowprops={"arrowstyle": "->", "color": "#8E2F2F", "lw": 0.9},
-    )
+    axc.text(cov_min * 100 + 1.5, LAT_MIN + 2.5, f"{cov_min:.0%} 门槛", fontsize=7.5,
+             color="#8E2F2F", rotation=90, va="bottom")
 
     fig.text(
         0.01,
         0.005,
         "注：纬向平均为同一纬度圈内有效海洋格点（非陆地/海冰）的算术平均，未乘 cosφ；\n"
-        f"覆盖率 = 有效格点数 / {N_LON_GLOBAL}（0.25° 全球经度格点）；覆盖率 < {cov_min:.0%} 的纬度不绘制曲线。",
-        fontsize=8.5,
+        f"海洋占比 zonal_ocean_frac = 有效格点数 / {N_LON_GLOBAL}，曲线只画 ≥ {cov_min:.0%} 的纬度；"
+        "有数据比例 coverage = 有效格点数 / ocean_grid_count（非海冰/非缺测），仅用于副图展示。",
+        fontsize=8.3,
         color="0.35",
         va="bottom",
     )
@@ -472,7 +509,7 @@ def plot_basins(ctx: dict, cov_min: float) -> Path:
         ax.plot(np.where(usable, sst, np.nan), lat, color=style["color"], lw=2.0, label=style["label"])
         mean = summary_means.get(name)
         if mean is None:
-            mean = basin_mean_cos(lat, sst, frame_coverage(frame), cov_min)
+            mean = valid_weighted_mean(frame, cov_min)
         if mean is not None:
             mean_text.append(f"{style['label']} {mean:.2f} °C")
 
@@ -484,13 +521,13 @@ def plot_basins(ctx: dict, cov_min: float) -> Path:
             ok = coverage_ok(frame, cov_min) & np.isfinite(values)
             ax2.plot(np.where(ok, values, np.nan), lat, color=style["color"], lw=1.25, ls=ls, alpha=alpha)
 
-    # 旧印度洋结果（仓库已提交的真实数据）作为对照
+    # 旧印度洋结果（仓库已提交的真实数据）作为对照；旧文件 coverage 即 valid/401
     if INDIAN_CSV.exists():
         old = pd.read_csv(INDIAN_CSV)
         lat_old = old["latitude"].to_numpy(dtype=float)
         sst_old = old["sst_annual"].to_numpy(dtype=float)
-        cov_old = frame_coverage(old)
-        ok = np.isfinite(sst_old) & (cov_old >= cov_min)
+        frac_old = zonal_ocean_fraction(old, N_LON_INDIAN)
+        ok = np.isfinite(sst_old) & np.isfinite(frac_old) & (frac_old >= cov_min)
         ax.plot(np.where(ok, sst_old, np.nan), lat_old, color="#7F8C8D", lw=2.0, ls=(0, (5, 2)),
                 label="印度洋（旧结果 20°E–120°E/40°S–30°N）")
 
@@ -528,7 +565,9 @@ def plot_basins(ctx: dict, cov_min: float) -> Path:
     note = (
         "注：分海盆边界为近似划分（印度洋 20°E–120°E，太平洋 120°E–280°E，其余归大西洋；"
         "66°N 以北为北冰洋，60°S 以南为南大洋）。"
-        "分盆 coverage 的分母是该纬度该海盆的海洋格点数（数据侧提供 ocean_grid_count 时）。"
+        "曲线门槛统一用海洋占比 valid_count/1440 ≥ "
+        f"{cov_min:.0%}（分盆文件无 zonal_ocean_frac 列时现算），"
+        "coverage（valid_count/ocean_grid_count）只反映冰情/缺测，不用于门槛。"
     )
     if ctx["synthetic"]:
         note += "\n本图海盆曲线为合成 fixture；灰色点划线「印度洋（旧结果）」来自仓库已提交的真实 CSV。"
@@ -571,14 +610,25 @@ def plot_map(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
     boundary_note = "未叠加海盆边界（basin_mask.npz 不存在）"
     if ctx["mask_npz"].exists():
         with np.load(ctx["mask_npz"]) as npz:
-            basin_id = npz["basin_id"]
-        if basin_id.shape == annual.shape:
+            keys = set(npz.files)
+            if "basin_mask" in keys:
+                basin_grid = npz["basin_mask"].astype(float)  # uint8: 0=陆地，1..5=海盆
+                levels = [0.5, 1.5, 2.5, 3.5, 4.5]
+                label = "basin_mask"
+            elif "basin_id" in keys:
+                basin_grid = npz["basin_id"].astype(float)    # int8: -1=陆地，0..4=海盆
+                levels = [-0.5, 0.5, 1.5, 2.5, 3.5]
+                label = "basin_id"
+            else:
+                basin_grid = None
+                levels = []
+                label = ""
+        if basin_grid is not None and basin_grid.shape == annual.shape:
             step = 4
-            levels = np.arange(-0.5, 5.0, 1.0)
-            ax.contour(lon[::step], lat[::step], basin_id[::step, ::step],
+            ax.contour(lon[::step], lat[::step], basin_grid[::step, ::step],
                        levels=levels, colors="0.25", linewidths=0.35, alpha=0.8)
-            boundary_note = "细线为近似海盆边界与海岸线"
-        else:
+            boundary_note = f"细线为海盆边界与海岸线（{label}）"
+        elif basin_grid is not None:
             boundary_note = "basin_mask.npz 形状不匹配，未画边界"
 
     ax.set_xlim(0, 360)
@@ -608,8 +658,8 @@ def plot_map(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
 def plot_heatmap(ctx: dict, cov_min: float) -> Path:
     df = pd.read_csv(ctx["global_csv"])
     lat = df["latitude"].to_numpy(dtype=float)
-    coverage = frame_coverage(df)
-    usable = coverage >= cov_min
+    ocean_frac = zonal_ocean_fraction(df)
+    usable = np.isfinite(ocean_frac) & (ocean_frac >= cov_min)
     months = np.arange(1, 13)
     data = np.vstack([df[f"sst_{m:02d}"].to_numpy(dtype=float) for m in months])
     masked = np.ma.masked_array(data, mask=(~np.isfinite(data)) | ~usable[None, :])
@@ -636,7 +686,7 @@ def plot_heatmap(ctx: dict, cov_min: float) -> Path:
     ax.set_xlabel("纬度")
     ax.set_ylabel("月份")
     subtitle = "合成数据（fixture）" if ctx["synthetic"] else "2016–2020 气候态"
-    ax.set_title(f"全球纬向平均海表温度：月份 × 纬度\n（{subtitle}，90°S–90°N，灰色 = 覆盖率 < {cov_min:.0%}）", fontsize=13)
+    ax.set_title(f"全球纬向平均海表温度：月份 × 纬度\n（{subtitle}，90°S–90°N，灰色 = 海洋占比 < {cov_min:.0%}）", fontsize=13)
     ax.grid(True, ls=":", lw=0.7, alpha=0.5, color="0.4")
     ax.set_axisbelow(True)
     for spine in ax.spines.values():
@@ -646,7 +696,8 @@ def plot_heatmap(ctx: dict, cov_min: float) -> Path:
         0.01,
         0.005,
         "注：每格为该纬度圈 12 个月气候态；12 个月等权平均得年均；"
-        "覆盖率不足的纬度置灰，不参与曲线与结论。",
+        f"海洋占比 valid/{N_LON_GLOBAL} 不足的纬度置灰，不参与曲线与结论；"
+        "灰色不代表冰情，coverage 见廓线副图。",
         fontsize=8.4,
         color="0.35",
         va="bottom",
@@ -666,8 +717,10 @@ def plot_indian_vs_global(ctx: dict, cov_min: float) -> Path:
     lat_glob = glob["latitude"].to_numpy(dtype=float)
     sst_old = old["sst_annual"].to_numpy(dtype=float)
     sst_glob = glob["sst_annual"].to_numpy(dtype=float)
-    ok_old = np.isfinite(sst_old) & (frame_coverage(old) >= cov_min)
-    ok_glob = np.isfinite(sst_glob) & (frame_coverage(glob) >= cov_min)
+    frac_old = zonal_ocean_fraction(old, N_LON_INDIAN)
+    frac_glob = zonal_ocean_fraction(glob)
+    ok_old = np.isfinite(sst_old) & np.isfinite(frac_old) & (frac_old >= cov_min)
+    ok_glob = np.isfinite(sst_glob) & np.isfinite(frac_glob) & (frac_glob >= cov_min)
 
     # 全球廓线插值到印度洋纬度，仅用于重叠区差值
     common = (lat_glob >= lat_old.min()) & (lat_glob <= lat_old.max())
@@ -712,8 +765,8 @@ def plot_indian_vs_global(ctx: dict, cov_min: float) -> Path:
     fig.text(
         0.01,
         0.005,
-        "注：旧印度洋结果来自仓库已提交的 data/zonal_mean.csv（281 行，0.25°）；"
-        "全球曲线覆盖 90°S–90°N。差值只在两者均有有效值且覆盖率 ≥ "
+        "注：旧印度洋结果来自仓库已提交的 data/zonal_mean.csv（281 行，0.25°），其 coverage=valid/401 "
+        "即海洋占比；全球曲线覆盖 90°S–90°N。差值只在两者均有有效值且海洋占比 ≥ "
         f"{cov_min:.0%} 的纬度计算。",
         fontsize=8.3,
         color="0.35",
@@ -730,14 +783,14 @@ def indian_regression_check() -> dict:
         raise SystemExit(f"缺少 {INDIAN_CSV}，无法做印度洋回归自检")
     df = pd.read_csv(INDIAN_CSV)
     lat = df["latitude"].to_numpy(dtype=float)
-    cov = frame_coverage(df)
+    ocean_frac = zonal_ocean_fraction(df, N_LON_INDIAN)
     annual = df["sst_annual"].to_numpy(dtype=float)
-    usable = np.isfinite(annual) & (cov >= DEFAULT_COVERAGE_MIN)
+    usable = np.isfinite(annual) & np.isfinite(ocean_frac) & (ocean_frac >= DEFAULT_COVERAGE_MIN)
 
     i_max = int(np.nanargmax(np.where(usable, annual, -np.inf)))
     isos = isotherm_crossings(lat[usable], annual[usable])
     iso_south = min(isos) if isos else float("nan")
-    mean = basin_mean_cos(lat, annual, cov, DEFAULT_COVERAGE_MIN)
+    mean = cos_weighted_mean(lat, annual, ocean_frac, DEFAULT_COVERAGE_MIN)
     measured = {
         "sst_max": float(annual[i_max]),
         "lat_max": float(abs(lat[i_max])) * (1 if lat[i_max] >= 0 else -1),

@@ -6,9 +6,10 @@
 --------
 1. **数值复算**：读取 ``data/raw/`` 下 60 个 ``sst_YYYY_MM.csv.gz``，独立重算纬向平均，
    抽 8 个纬度 × 1 月/7 月两个月份，与 ``zonal_mean_basins.csv`` 的 global 行对齐到 0.01 °C。
-2. **结构性检查**：720 行、0.25° 步长、纬度单调、``coverage ∈ [0,1]``、
-   ``valid_count`` 与 ``coverage`` 自洽、海洋值不越界、1 月/7 月南北半球季节反相。
-3. **网格一致性**：``climatology_grid.npz`` 形状/键齐全，且在"全海洋"纬度上其纬向平均
+2. **结构性检查**：720 行、0.25° 步长、纬度单调，``coverage = valid_count/ocean_grid_count``、
+   ``zonal_ocean_frac = valid_count/1440``、``cov_MM`` 与 ``sst_MM`` 的 NaN 模式（均容差 0.002）、
+   海洋值不越界、1 月/7 月南北半球季节反相；新列缺失时自动退回旧口径（coverage≈valid/1440）。
+3. **网格一致性**：``climatology_grid.npz`` 形状/键齐全，且在"有效格点全覆盖"的纬度上其纬向平均
    与 CSV 一致（避免冰缘处"先平均后加权"的固有差异被误判）。
 4. **在线抽样**：直接向 ERDDAP 取 2–3 个时次 × 一条约 1° 宽的纬度带（很小的请求），
    与本地同一时次的 ``data/raw/`` 逐纬圈比对，容差 0.05 °C；网络不通时**跳过**，不算失败。
@@ -150,6 +151,81 @@ def read_raw_csv(path: Path) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # 1. 全球纬向平均 CSV
 # --------------------------------------------------------------------------- #
+def coverage_consistency(frame: pd.DataFrame, label: str) -> tuple[list[str], dict[str, Any]]:
+    """按最终契约检查 coverage / zonal_ocean_frac / cov_MM 的自洽性（存在则用，缺失则降级）。"""
+    problems: list[str] = []
+    info: dict[str, Any] = {}
+    cov = frame["coverage"].to_numpy(dtype=float)
+    valid = frame["valid_count"].to_numpy(dtype=float)
+    finite_cov = cov[np.isfinite(cov)]
+    if finite_cov.size == 0:
+        problems.append(f"{label}: coverage 全为 NaN")
+    else:
+        if finite_cov.min() < 0 or finite_cov.max() > 1:
+            problems.append(f"{label}: coverage 越界 [{finite_cov.min():.4f}, {finite_cov.max():.4f}]")
+        info["coverage_range"] = [float(finite_cov.min()), float(finite_cov.max())]
+    if not np.all(np.isfinite(valid)) or valid.min() < 0 or valid.max() > N_LON_GLOBAL + 1e-6:
+        problems.append(f"{label}: valid_count 越界或含 NaN")
+
+    if "ocean_grid_count" in frame:
+        ocean = frame["ocean_grid_count"].to_numpy(dtype=float)
+        if not np.all(np.isfinite(ocean)) or ocean.min() < 0 or ocean.max() > N_LON_GLOBAL + 1e-6:
+            problems.append(f"{label}: ocean_grid_count 越界或含 NaN")
+        mask = (ocean > 0) & np.isfinite(valid) & np.isfinite(cov)
+        cov_err = float(np.max(np.abs(cov[mask] - valid[mask] / ocean[mask]))) if mask.any() else float("nan")
+        if not mask.any():
+            problems.append(f"{label}: 没有可用于核对 coverage 的海洋纬度")
+        if np.any((ocean == 0) & np.isfinite(cov) & (cov > 1e-9)):
+            problems.append(f"{label}: ocean_grid_count=0 的纬度 coverage 应为 NaN 或 0")
+        annual_finite = (
+            np.isfinite(frame["sst_annual"].to_numpy(dtype=float))
+            if "sst_annual" in frame
+            else np.ones(len(frame), dtype=bool)
+        )
+        if np.any((ocean > 0) & annual_finite & ~np.isfinite(cov)):
+            problems.append(f"{label}: 年均 SST 有效的海洋纬度出现 coverage=NaN")
+        info["coverage_denominator"] = "ocean_grid_count"
+    else:
+        mask = np.isfinite(cov) & np.isfinite(valid)
+        cov_err = float(np.max(np.abs(cov[mask] - valid[mask] / N_LON_GLOBAL))) if mask.any() else float("nan")
+        info["coverage_denominator"] = f"{N_LON_GLOBAL}(legacy)"
+    info["max_coverage_error"] = cov_err
+    if not np.isfinite(cov_err) or cov_err > 0.002:
+        problems.append(f"{label}: coverage 与 valid_count/分母不自洽（最大偏差 {cov_err:.5f} > 0.002）")
+
+    if "zonal_ocean_frac" in frame:
+        zof = frame["zonal_ocean_frac"].to_numpy(dtype=float)
+        finite_zof = zof[np.isfinite(zof)]
+        if finite_zof.size and (finite_zof.min() < 0 or finite_zof.max() > 1):
+            problems.append(f"{label}: zonal_ocean_frac 越界 [{finite_zof.min():.4f}, {finite_zof.max():.4f}]")
+        zmask = np.isfinite(valid) & np.isfinite(zof)
+        zof_err = float(np.max(np.abs(zof[zmask] - valid[zmask] / N_LON_GLOBAL))) if zmask.any() else float("nan")
+        info["max_zonal_ocean_frac_error"] = zof_err
+        if np.any(np.isfinite(valid) & (valid > 0) & ~np.isfinite(zof)):
+            problems.append(f"{label}: 有效格点数 >0 的纬度出现 zonal_ocean_frac=NaN")
+        if not np.isfinite(zof_err) or zof_err > 0.002:
+            problems.append(f"{label}: zonal_ocean_frac 与 valid_count/1440 不自洽（最大偏差 {zof_err:.5f} > 0.002）")
+
+    checked = 0
+    mismatched: list[str] = []
+    for m in range(1, 13):
+        cov_col = f"cov_{m:02d}"
+        sst_col = f"sst_{m:02d}"
+        if cov_col not in frame or sst_col not in frame:
+            continue
+        checked += 1
+        cov_nan = np.isnan(frame[cov_col].to_numpy(dtype=float))
+        sst_nan = np.isnan(frame[sst_col].to_numpy(dtype=float))
+        if not np.array_equal(cov_nan, sst_nan):
+            mismatched.append(f"cov_{m:02d}/sst_{m:02d}")
+    if 0 < checked < 12:
+        problems.append(f"{label}: cov_MM 列不完整（只有 {checked}/12 个月）")
+    if mismatched:
+        problems.append(f"{label}: cov_MM 与 sst_MM 的 NaN 模式不一致（{', '.join(mismatched[:4])}）")
+    info["cov_sst_nan_pattern_months"] = checked
+    return problems, info
+
+
 def check_global_zonal(path: Path) -> dict:
     name = "zonal_mean_global.csv 结构"
     if not path.exists():
@@ -158,14 +234,17 @@ def check_global_zonal(path: Path) -> dict:
         df = pd.read_csv(path)
     except Exception as exc:  # noqa: BLE001
         return make_check(name, "fail", f"无法读取 {path}：{exc}")
+    if df.empty:
+        return make_check(name, "fail", "文件为空", {"rows": 0})
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        return make_check(name, "fail", f"缺少必需列：{missing}")
     problems: list[str] = []
 
     if list(df.columns[:18]) != REQUIRED_COLUMNS:
         problems.append(f"前 18 列与契约不符：{list(df.columns[:18])}")
     if len(df) != N_LAT_GLOBAL:
         problems.append(f"行数 {len(df)} != {N_LAT_GLOBAL}")
-    if df.empty:
-        return make_check(name, "fail", "文件为空", {"rows": 0})
 
     lat = df["latitude"].to_numpy(dtype=float)
     if len(lat) > 1:
@@ -176,15 +255,17 @@ def check_global_zonal(path: Path) -> dict:
     if abs(lat[0] - LAT_FIRST) > 1e-6 or abs(lat[-1] - LAT_LAST) > 1e-6:
         problems.append(f"纬度端点 {lat[0]:.3f}…{lat[-1]:.3f} 不是 -89.875…89.875")
 
-    valid = df["valid_count"].to_numpy(dtype=float)
+    # coverage / zonal_ocean_frac / cov_MM 自洽性
+    cov_problems, cov_info = coverage_consistency(df, "global")
+    problems += cov_problems
+
     coverage = df["coverage"].to_numpy(dtype=float)
-    if not np.all(np.isfinite(coverage)) or coverage.min() < 0 or coverage.max() > 1:
-        problems.append(f"coverage 越界：[{np.nanmin(coverage)}, {np.nanmax(coverage)}]")
-    if not np.all(np.isfinite(valid)) or valid.min() < 0 or valid.max() > N_LON_GLOBAL + 1e-6:
-        problems.append(f"valid_count 越界：[{np.nanmin(valid)}, {np.nanmax(valid)}]")
-    max_cov_err = float(np.nanmax(np.abs(coverage - valid / N_LON_GLOBAL)))
-    if max_cov_err > 1.1e-3:
-        problems.append(f"coverage 与 valid_count/1440 不自洽（最大偏差 {max_cov_err:.5f}）")
+    valid = df["valid_count"].to_numpy(dtype=float)
+    ocean_frac = (
+        df["zonal_ocean_frac"].to_numpy(dtype=float)
+        if "zonal_ocean_frac" in df
+        else valid / N_LON_GLOBAL
+    )
 
     ocean_max = -np.inf
     ocean_min = np.inf
@@ -199,13 +280,14 @@ def check_global_zonal(path: Path) -> dict:
     if ocean_min < SST_MIN:
         problems.append(f"海洋 SST 最小值 {ocean_min:.2f} < {SST_MIN}")
 
-    # 1 月 / 7 月南北半球季节反相（20°–60°，cosφ 加权）
+    # 1 月 / 7 月南北半球季节反相（20°–60°，cosφ 加权；门槛用海洋占比）
     def band_mean(col: str, north: bool) -> float:
         sst = df[col].to_numpy(dtype=float)
-        mask = (np.abs(lat) >= 20) & (np.abs(lat) <= 60) & (coverage >= COVERAGE_MIN)
+        mask = (np.abs(lat) >= 20) & (np.abs(lat) <= 60)
+        mask &= np.isfinite(ocean_frac) & (ocean_frac >= COVERAGE_MIN)
         mask &= (lat > 0) if north else (lat < 0)
         w = np.cos(np.deg2rad(lat[mask]))
-        return float(np.sum(w * sst[mask]) / np.sum(w))
+        return float(np.sum(w * sst[mask]) / np.sum(w)) if mask.any() else float("nan")
 
     nh_jan, nh_jul = band_mean("sst_jan", True), band_mean("sst_jul", True)
     sh_jan, sh_jul = band_mean("sst_jan", False), band_mean("sst_jul", False)
@@ -213,13 +295,11 @@ def check_global_zonal(path: Path) -> dict:
         "rows": len(df),
         "lat_first": float(lat[0]),
         "lat_last": float(lat[-1]),
-        "coverage_min": float(np.nanmin(coverage)),
-        "coverage_max": float(np.nanmax(coverage)),
-        "max_coverage_error": max_cov_err,
         "sst_min": ocean_min,
         "sst_max": ocean_max,
         "nh_jan_minus_jul": nh_jan - nh_jul,
         "sh_jan_minus_jul": sh_jan - sh_jul,
+        **cov_info,
     }
     if not nh_jan < nh_jul - 1.0:
         problems.append(f"北半球 1 月未明显冷于 7 月（{nh_jan:.2f} vs {nh_jul:.2f}）")
@@ -228,12 +308,15 @@ def check_global_zonal(path: Path) -> dict:
 
     if problems:
         return make_check(name, "fail", "；".join(problems), metrics)
+    cov_range = metrics.get("coverage_range", [float("nan"), float("nan")])
     return make_check(
         name,
         "pass",
-        f"{len(df)} 行，纬度 {lat[0]:.3f}→{lat[-1]:.3f}，步长 {LAT_STEP}°，"
-        f"coverage∈[{coverage.min():.4f},{coverage.max():.4f}]，海洋值∈[{ocean_min:.2f},{ocean_max:.2f}] °C，"
-        f"南北半球季节反相（NH Δ={nh_jan - nh_jul:+.2f} °C，SH Δ={sh_jan - sh_jul:+.2f} °C）",
+        f"{len(df)} 行，纬度 {lat[0]:.3f}→{lat[-1]:.3f}，步长 {LAT_STEP}°；"
+        f"coverage∈[{cov_range[0]:.4f},{cov_range[1]:.4f}]（分母 {metrics.get('coverage_denominator')}），"
+        f"zonal_ocean_frac 误差≤{metrics.get('max_zonal_ocean_frac_error', float('nan')):.5f}，"
+        f"cov_MM 与 sst_MM NaN 模式一致（{metrics.get('cov_sst_nan_pattern_months', 0)} 个月），"
+        f"海洋值∈[{ocean_min:.2f},{ocean_max:.2f}] °C，南北半球季节反相",
         metrics,
     )
 
@@ -256,6 +339,12 @@ def check_basins_zonal(path: Path, global_df: pd.DataFrame | None) -> dict:
     problems: list[str] = []
     metrics: dict[str, Any] = {"basins": {}}
 
+    expected_order = ["global", "pacific", "atlantic", "indian", "arctic", "southern"]
+    seen = list(dict.fromkeys(df[basin_col].tolist()))
+    metrics["basin_order"] = seen
+    if set(expected_order) - set(seen):
+        problems.append(f"缺少海盆：{sorted(set(expected_order) - set(seen))}")
+
     lat_ref = global_df["latitude"].to_numpy(dtype=float) if global_df is not None else None
     for basin, group in df.groupby(basin_col, sort=False):
         group = group.reset_index(drop=True)
@@ -263,6 +352,10 @@ def check_basins_zonal(path: Path, global_df: pd.DataFrame | None) -> dict:
         metrics["basins"][str(basin)] = info
         if list(group.columns[1:19]) != REQUIRED_COLUMNS:
             problems.append(f"{basin}: 首列之后前 18 列与契约不符")
+        missing = [c for c in REQUIRED_COLUMNS if c not in group.columns]
+        if missing:
+            problems.append(f"{basin}: 缺少必需列 {missing}")
+            continue
         if len(group) != N_LAT_GLOBAL:
             problems.append(f"{basin}: 行数 {len(group)} != {N_LAT_GLOBAL}")
             continue
@@ -271,32 +364,10 @@ def check_basins_zonal(path: Path, global_df: pd.DataFrame | None) -> dict:
             problems.append(f"{basin}: 纬度网格与全球文件不一致")
         if not np.all(np.diff(lat) > 0) or not np.allclose(np.diff(lat), LAT_STEP, atol=1e-9):
             problems.append(f"{basin}: 纬度不是 0.25° 单调网格")
-        cov = group["coverage"].to_numpy(dtype=float)
-        valid = group["valid_count"].to_numpy(dtype=float)
-        if cov.min() < 0 or cov.max() > 1:
-            problems.append(f"{basin}: coverage 越界 [{cov.min()}, {cov.max()}]")
-        info["coverage_range"] = [float(cov.min()), float(cov.max())]
-        if basin == "global":
-            err = float(np.nanmax(np.abs(cov - valid / N_LON_GLOBAL)))
-            info["coverage_denominator"] = N_LON_GLOBAL
-            info["max_coverage_error"] = err
-            if err > 1.1e-3:
-                problems.append(f"global: coverage 与 valid_count/1440 不自洽（{err:.5f}）")
-        else:
-            err_1440 = float(np.nanmax(np.abs(cov - valid / N_LON_GLOBAL)))
-            best = err_1440
-            denom = N_LON_GLOBAL
-            if "ocean_grid_count" in group:
-                ocean = group["ocean_grid_count"].to_numpy(dtype=float)
-                with np.errstate(invalid="ignore", divide="ignore"):
-                    err_ocean = np.where(ocean > 0, np.abs(cov - valid / np.where(ocean > 0, ocean, 1)), 0.0)
-                if float(np.nanmax(err_ocean)) < best:
-                    best = float(np.nanmax(err_ocean))
-                    denom = "ocean_grid_count"
-            info["coverage_denominator"] = denom
-            info["max_coverage_error"] = best
-            if best > 1.1e-3:
-                problems.append(f"{basin}: coverage 与 valid_count 分母（1440 或 ocean_grid_count）不自洽（{best:.5f}）")
+
+        cov_problems, cov_info = coverage_consistency(group, str(basin))
+        problems += cov_problems
+        info.update(cov_info)
 
         for col in REQUIRED_COLUMNS[3:]:
             values = group[col].to_numpy(dtype=float)
@@ -309,21 +380,23 @@ def check_basins_zonal(path: Path, global_df: pd.DataFrame | None) -> dict:
         problems.append("缺少 global 海盆行")
     elif global_df is not None:
         g = df[df[basin_col] == "global"].reset_index(drop=True)
-        for col in ("sst_annual", "sst_jan", "sst_jul"):
+        for col in ("sst_annual", "sst_jan", "sst_jul", "coverage"):
             a = g[col].to_numpy(dtype=float)
             b = global_df[col].to_numpy(dtype=float)
-            diff = float(np.nanmax(np.abs(a - b)))
+            mask = np.isfinite(a) & np.isfinite(b)
+            diff = float(np.max(np.abs(a[mask] - b[mask]))) if mask.any() else float("nan")
             metrics["basins"]["global"][f"max_diff_vs_global_{col}"] = diff
-            if diff > NUMERIC_TOL:
-                problems.append(f"global 行 {col} 与全球文件最大偏差 {diff:.4f} > {NUMERIC_TOL}")
+            if not np.isfinite(diff) or diff > 0.002:
+                problems.append(f"global 行 {col} 与全球文件最大偏差 {diff:.5f} > 0.002")
 
     if problems:
         return make_check(name, "fail", "；".join(problems), metrics)
     return make_check(
         name,
         "pass",
-        f"{len(metrics['basins'])} 个海盆 × {N_LAT_GLOBAL} 行，纬度/覆盖率/温度范围自洽"
-        + ("，global 行与全球文件一致" if global_df is not None else ""),
+        f"{len(metrics['basins'])} 个海盆 × {N_LAT_GLOBAL} 行；coverage 分母 "
+        f"{metrics['basins'].get('global', {}).get('coverage_denominator', '?')}，"
+        "coverage/zonal_ocean_frac/cov_MM 自洽，global 行与全球文件一致",
         metrics,
     )
 
@@ -373,15 +446,15 @@ def check_grid(path: Path, global_df: pd.DataFrame | None) -> dict:
         if finite.max() > SST_MAX or finite.min() < SST_MIN:
             problems.append(f"网格值越界 [{finite.min():.2f}, {finite.max():.2f}]")
 
-    # 只在"60 个时次全为海洋"的纬度比较，避开冰缘处先平均/后平均的口径差异
+    # 只在"该纬圈所有海洋格点在 60 个时次都有数据"（coverage==1）的纬度比较，
+    # 避开冰缘处先平均/后平均的口径差异；coverage 新定义下这些纬度允许仍有陆地。
     if global_df is not None and not problems:
-        lat_csv = global_df["latitude"].to_numpy(dtype=float)
         cov_csv = global_df["coverage"].to_numpy(dtype=float)
         full = np.isclose(cov_csv, 1.0, atol=1e-9) & np.isfinite(global_df["sst_annual"].to_numpy(dtype=float))
         n_full = int(full.sum())
         metrics["full_ocean_latitudes"] = n_full
         if n_full < 5:
-            metrics["grid_check"] = "skipped（全海洋纬度不足 5 个）"
+            metrics["grid_check"] = "skipped（有效格点全覆盖纬度不足 5 个）"
         else:
             checks = {"sst_annual": (annual, global_df["sst_annual"].to_numpy(dtype=float))}
             for m in (1, 4, 7, 10):
@@ -393,14 +466,14 @@ def check_grid(path: Path, global_df: pd.DataFrame | None) -> dict:
                     grid_mean = np.nanmean(grid[full], axis=1)
                 diff = float(np.nanmax(np.abs(grid_mean - csv[full])))
                 if not np.isfinite(diff):
-                    problems.append(f"全海洋纬度上 {key} 的网格纬向平均出现 NaN")
+                    problems.append(f"有效格点全覆盖纬度上 {key} 的网格纬向平均出现 NaN")
                     continue
                 if diff > worst:
                     worst, worst_key = diff, key
             metrics["max_grid_zonal_diff"] = {"key": worst_key, "value": worst, "n_lat": n_full}
             if worst > GRID_TOL:
                 problems.append(
-                    f"全海洋纬度上网格纬向平均与 CSV 最大偏差 {worst:.4f}（{worst_key}）> {GRID_TOL}"
+                    f"有效格点全覆盖纬度上网格纬向平均与 CSV 最大偏差 {worst:.4f}（{worst_key}）> {GRID_TOL}"
                 )
 
     if problems:
@@ -410,7 +483,7 @@ def check_grid(path: Path, global_df: pd.DataFrame | None) -> dict:
         "pass",
         f"{len(lat)}×{len(lon)} 网格，{len(monthly)} 个月 + 年均键齐全，"
         f"海洋格点占比 {metrics.get('ocean_fraction', float('nan')):.1%}，"
-        f"全海洋纬度 {metrics.get('full_ocean_latitudes', 0)} 个上纬向平均与 CSV 最大偏差 "
+        f"有效格点全覆盖纬度 {metrics.get('full_ocean_latitudes', 0)} 个上纬向平均与 CSV 最大偏差 "
         f"{metrics.get('max_grid_zonal_diff', {}).get('value', float('nan')):.4f} °C",
         metrics,
     )
@@ -609,7 +682,7 @@ def check_indian_regression(path: Path) -> dict:
         return make_check(name, "skip", f"缺少 {path}，跳过回归")
     df = pd.read_csv(path)
     lat = df["latitude"].to_numpy(dtype=float)
-    coverage = df["coverage"].to_numpy(dtype=float)
+    coverage = df["coverage"].to_numpy(dtype=float)  # 旧文件 coverage=valid/401，即海洋占比
     annual = df["sst_annual"].to_numpy(dtype=float)
     usable = np.isfinite(annual) & (coverage >= COVERAGE_MIN)
     i_max = int(np.nanargmax(np.where(usable, annual, -np.inf)))

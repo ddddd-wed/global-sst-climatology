@@ -169,11 +169,58 @@ class TestStructuralChecks(unittest.TestCase):
             df[f"sst_{m:02d}"] = annual
         return df[verify.REQUIRED_COLUMNS]
 
+    @staticmethod
+    def _new_frame() -> pd.DataFrame:
+        """最终契约格式：coverage=valid/ocean_grid_count，zonal_ocean_frac=valid/1440，cov_MM 同 NaN。"""
+        df = TestStructuralChecks._frame()
+        ocean_count, valid = 800.0, 800.0
+        df["ocean_grid_count"] = ocean_count
+        df["valid_count"] = valid
+        df["coverage"] = valid / ocean_count
+        df["zonal_ocean_frac"] = valid / verify.N_LON_GLOBAL
+        for m in range(1, 13):
+            df[f"cov_{m:02d}"] = valid / ocean_count
+        return df
+
     def test_valid_global_csv_passes(self) -> None:
         path = scratch_dir("valid") / "zonal_mean_global.csv"
         self._frame().to_csv(path, index=False)
         result = verify.check_global_zonal(path)
         self.assertEqual(result["status"], "pass", result["detail"])
+
+    def test_new_contract_columns_pass(self) -> None:
+        path = scratch_dir("newcols") / "zonal_mean_global.csv"
+        self._new_frame().to_csv(path, index=False)
+        result = verify.check_global_zonal(path)
+        self.assertEqual(result["status"], "pass", result["detail"])
+        self.assertEqual(result["metrics"]["coverage_denominator"], "ocean_grid_count")
+
+    def test_coverage_denominator_mismatch_fails(self) -> None:
+        df = self._new_frame()
+        df.loc[10, "coverage"] = 0.9  # 应为 valid/ocean_grid_count = 1.0
+        path = scratch_dir("badcov") / "zonal_mean_global.csv"
+        df.to_csv(path, index=False)
+        result = verify.check_global_zonal(path)
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("coverage", result["detail"])
+
+    def test_zonal_ocean_frac_mismatch_fails(self) -> None:
+        df = self._new_frame()
+        df.loc[10, "zonal_ocean_frac"] = 0.5  # 应为 800/1440
+        path = scratch_dir("badfrac") / "zonal_mean_global.csv"
+        df.to_csv(path, index=False)
+        result = verify.check_global_zonal(path)
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("zonal_ocean_frac", result["detail"])
+
+    def test_cov_sst_nan_pattern_mismatch_fails(self) -> None:
+        df = self._new_frame()
+        df.loc[10, "cov_01"] = np.nan  # sst_01 仍为有限值
+        path = scratch_dir("badnan") / "zonal_mean_global.csv"
+        df.to_csv(path, index=False)
+        result = verify.check_global_zonal(path)
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("NaN 模式", result["detail"])
 
     def test_broken_coverage_fails(self) -> None:
         df = self._frame()
