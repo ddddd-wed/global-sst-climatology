@@ -1,16 +1,29 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""根据 data/zonal_mean.csv 绘制两张图：
+"""全球海表温度（SST）纬向结构与五大洋对比 —— 绘图脚本。
 
-1. figures/sst_vs_latitude.png  —— 年均 / 1 月 / 7 月 SST 随纬度变化 + 覆盖率面板
-2. figures/lat_month_heatmap.png —— 12 个月 × 纬度的纬向平均 SST 热图
+输出（真实数据就绪时写到 ``figures/``，否则自动降级到 ``figures/dev/``）：
 
-只绘制有效海洋格点覆盖率 >= 10% 的纬度段（北端约 26°N 以北不绘制）。
-图像标签全部为中文，使用 Microsoft YaHei / SimHei 字体；保存后检查是否有字形缺失（豆腐块）。
+1. ``global_sst_vs_latitude.png`` —— 90°S–90°N 年均 / 1 月 / 7 月曲线 + 覆盖率面板，
+   年均 25 °C 等温线的**南北半球交点**同时标出；
+2. ``basins_sst_vs_latitude.png`` —— 五大洋分盆年均曲线 + 旧印度洋结果对照 + 1/7 月面板；
+3. ``global_sst_map.png`` —— 0.25° 全球年均 SST 等经纬投影地图（叠加 25 °C 等值线）；
+4. ``lat_month_heatmap.png`` —— 全球 月份 × 纬度 热图；
+5. ``indian_vs_global.png`` —— 印度洋旧廓线 vs 全球廓线 + 差值副图。
+
+真实数据文件（``data/zonal_mean_global.csv``、``data/zonal_mean_basins.csv``、
+``data/climatology_grid.npz``）不存在时，打印「真实数据未就绪，使用 fixture」，
+在 ``.tmp/fixture/`` 自动生成合成数据并出图到 ``figures/dev/``，进程 0 退出。
+合成数据只用于开发自测，图上会打「合成数据」水印，绝不会写入 ``data/``。
+
+统计口径与数据侧一致：0.25° 原生格点、同纬圈非 NaN 海洋格点算术平均（不乘 cosφ）、
+12 个月等权得年均、``coverage = valid_count / 1440``、覆盖率 < 10% 的纬度不绘制。
 """
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
 import struct
 import sys
@@ -20,9 +33,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from config import COVERAGE_MIN, FIG_DIR, LAT_MAX, LAT_MIN, ZONAL_CSV
-
 ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPTS_DIR))
 # 沙箱/只读 HOME 环境下 matplotlib 无法写入 ~/.matplotlib，缓存改放仓库内
 os.environ.setdefault("MPLCONFIGDIR", str(ROOT / ".mplconfig"))
 
@@ -31,14 +44,52 @@ import matplotlib  # noqa: E402
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib import font_manager, text as mtext  # noqa: E402
+from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.ticker import FuncFormatter  # noqa: E402
 
-from compute import find_isotherm  # noqa: E402
+DATA_DIR = ROOT / "data"
+FIG_DIR = ROOT / "figures"
+DEV_FIG_DIR = FIG_DIR / "dev"
+FIXTURE_DIR = ROOT / ".tmp" / "fixture"
 
+GLOBAL_CSV = DATA_DIR / "zonal_mean_global.csv"
+BASINS_CSV = DATA_DIR / "zonal_mean_basins.csv"
+GRID_NPZ = DATA_DIR / "climatology_grid.npz"
+MASK_NPZ = DATA_DIR / "basin_mask.npz"
+SUMMARY_JSON = DATA_DIR / "summary_metrics.json"
+INDIAN_CSV = DATA_DIR / "zonal_mean.csv"
+
+# 覆盖率阈值：可配置常量（也支持 --coverage-min / 环境变量 SST_COVERAGE_MIN）
+DEFAULT_COVERAGE_MIN = float(os.environ.get("SST_COVERAGE_MIN", "0.10"))
+N_LON_GLOBAL = 1440          # 0.25° 全球经度格点数，coverage 的分母
+LAT_MIN, LAT_MAX = -90.0, 90.0
+ISOTHERM_LEVEL = 25.0
 DPI = 200
 FONT_NAME = "Microsoft YaHei"
 
+# 海盆配色固定，便于跨图对照
+BASIN_STYLE: dict[str, dict] = {
+    "global": {"label": "全球", "color": "#111111"},
+    "indian": {"label": "印度洋", "color": "#E67E22"},
+    "pacific": {"label": "太平洋", "color": "#2E86C1"},
+    "atlantic": {"label": "大西洋", "color": "#27AE60"},
+    "arctic": {"label": "北冰洋", "color": "#8E44AD"},
+    "southern": {"label": "南大洋", "color": "#C0392B"},
+}
+BASIN_ORDER = ("indian", "pacific", "atlantic", "arctic", "southern")
 
+# 印度洋旧结果回归基准（README 现值，来自仓库已提交的 data/zonal_mean.csv）
+INDIAN_BASELINE = {
+    "sst_max": (29.14, 0.01),
+    "lat_max": (2.125, 0.01),
+    "isotherm_south": (-21.664, 0.01),
+    "basin_mean": (26.163, 0.005),
+}
+
+
+# --------------------------------------------------------------------------- #
+# 字体 / PNG 基础设施
+# --------------------------------------------------------------------------- #
 def setup_chinese_font() -> str:
     global FONT_NAME
     available = {f.name for f in font_manager.fontManager.ttflist}
@@ -59,7 +110,7 @@ def setup_chinese_font() -> str:
 
 
 def verify_glyphs(fig: plt.Figure) -> None:
-    """逐个检查图中实际用到的字符在所选字体中是否有字形，防止出现豆腐块（□）。"""
+    """逐个检查图中实际用到的非 ASCII 字符是否有字形，防止豆腐块（□）。"""
     font_path = font_manager.findfont(font_manager.FontProperties(family=FONT_NAME))
     face = font_manager.get_font(font_path)
     chars = sorted(
@@ -71,14 +122,86 @@ def verify_glyphs(fig: plt.Figure) -> None:
     print(f"  字形检查通过：图中 {len(chars)} 个非 ASCII 字符在 {FONT_NAME} 中均有字形", flush=True)
 
 
+def save_png(fig: plt.Figure, path: Path, dpi: int = DPI) -> tuple[int, int, int]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.canvas.draw()
+    verify_glyphs(fig)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        fig.savefig(path, dpi=dpi, bbox_inches="tight", facecolor="white")
+    missing = [str(w.message) for w in caught if "missing from font" in str(w.message)]
+    plt.close(fig)
+    if missing:
+        raise RuntimeError("PNG 中存在缺失字形（豆腐块）：\n" + "\n".join(missing))
+    with open(path, "rb") as fh:
+        head = fh.read(24)
+    if head[:8] != b"\x89PNG\r\n\x1a\n":
+        raise RuntimeError(f"{path} 不是合法 PNG")
+    width, height = struct.unpack(">II", head[16:24])
+    size_kb = path.stat().st_size / 1024
+    print(f"已生成 {path}：{width}×{height} px，{size_kb:.0f} KB", flush=True)
+    return width, height, int(path.stat().st_size)
+
+
+def add_synthetic_watermark(fig: plt.Figure) -> None:
+    fig.text(
+        0.5,
+        0.5,
+        "合成数据 · 非真实结果",
+        fontsize=46,
+        color="#C0392B",
+        alpha=0.10,
+        ha="center",
+        va="center",
+        rotation=18,
+        zorder=50,
+    )
+    fig.text(
+        0.995,
+        0.005,
+        "fixture（make_fixture.py 生成，仅开发自测）",
+        fontsize=8,
+        color="#B03A2E",
+        ha="right",
+        va="bottom",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 通用小工具
+# --------------------------------------------------------------------------- #
 def lat_formatter(value: float, _pos=None) -> str:
     if abs(value) < 1e-9:
         return "0°"
     return f"{abs(value):.0f}°{'N' if value > 0 else 'S'}"
 
 
+def isotherm_crossings(lat: np.ndarray, sst: np.ndarray, level: float = ISOTHERM_LEVEL) -> list[float]:
+    """线性插值求等温线纬度，返回**所有**交点（升序），不再只取最后一个。"""
+    crossings: list[float] = []
+    for i in range(len(lat) - 1):
+        y1, y2 = sst[i], sst[i + 1]
+        if not (np.isfinite(y1) and np.isfinite(y2)) or y1 == y2:
+            continue
+        if (y1 - level) * (y2 - level) <= 0:
+            t = (level - y1) / (y2 - y1)
+            crossings.append(float(lat[i] + t * (lat[i + 1] - lat[i])))
+    deduped: list[float] = []
+    for c in crossings:
+        if not deduped or abs(c - deduped[-1]) > 1e-6:
+            deduped.append(c)
+    return deduped
+
+
+def basin_mean_cos(lat: np.ndarray, sst: np.ndarray, coverage: np.ndarray, cov_min: float) -> float | None:
+    usable = np.isfinite(sst) & (coverage >= cov_min)
+    if not usable.any():
+        return None
+    weights = np.cos(np.deg2rad(lat[usable]))
+    return float(np.sum(weights * sst[usable]) / np.sum(weights))
+
+
 def bad_runs(lat: np.ndarray, bad: np.ndarray) -> list[tuple[float, float]]:
-    """把覆盖率不足的纬度段合并成连续区间。"""
     runs: list[tuple[float, float]] = []
     start = None
     for i, flag in enumerate(bad):
@@ -92,89 +215,211 @@ def bad_runs(lat: np.ndarray, bad: np.ndarray) -> list[tuple[float, float]]:
     return runs
 
 
-def save_png(fig: plt.Figure, path: Path) -> tuple[int, int, int]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.canvas.draw()
-    verify_glyphs(fig)
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        fig.savefig(path, dpi=DPI, bbox_inches="tight", facecolor="white")
-    missing = [str(w.message) for w in caught if "missing from font" in str(w.message)]
-    plt.close(fig)
-    if missing:
-        raise RuntimeError("PNG 中存在缺失字形（豆腐块）：\n" + "\n".join(missing))
-    with open(path, "rb") as fh:
-        head = fh.read(24)
-    if head[:8] != b"\x89PNG\r\n\x1a\n":
-        raise RuntimeError(f"{path} 不是合法 PNG")
-    width, height = struct.unpack(">II", head[16:24])
-    print(f"已生成 {path.relative_to(ROOT)}：{width}×{height} px，{path.stat().st_size / 1024:.0f} KB", flush=True)
-    return width, height, path.stat().st_size
-
-
-def plot_profiles(df: pd.DataFrame) -> Path:
-    lat = df["latitude"].to_numpy(dtype=float)
-    coverage = df["coverage"].to_numpy(dtype=float)
-    usable = (coverage >= COVERAGE_MIN) & np.isfinite(df["sst_annual"].to_numpy(dtype=float))
-    iso_list = find_isotherm(lat[usable], df["sst_annual"].to_numpy(dtype=float)[usable])
-
-    fig = plt.figure(figsize=(11.6, 7.2))
-    gs = fig.add_gridspec(1, 2, width_ratios=[4.3, 1.05], wspace=0.06)
-    ax = fig.add_subplot(gs[0, 0])
-    axc = fig.add_subplot(gs[0, 1], sharey=ax)
-
-    # 覆盖率 <10% 的纬度段（主要是北端）用浅灰底色标出，曲线不绘制
+def shaded_bad_latitudes(ax: plt.Axes, lat: np.ndarray, bad: np.ndarray, cov_min: float, label: bool = True) -> None:
     shaded = False
-    for y0, y1 in bad_runs(lat, ~usable):
-        ax.axhspan(y0 - 0.125, y1 + 0.125, color="0.90", zorder=0,
-                   label=None if shaded else f"覆盖率 < {COVERAGE_MIN:.0%}（不绘制）")
-        axc.axhspan(y0 - 0.125, y1 + 0.125, color="0.90", zorder=0)
+    for y0, y1 in bad_runs(lat, bad):
+        ax.axhspan(
+            y0 - 0.125,
+            y1 + 0.125,
+            color="0.90",
+            zorder=0,
+            label=(f"覆盖率 < {cov_min:.0%}（不绘制）" if label and not shaded else None),
+        )
         shaded = True
 
-    series = [
-        ("sst_annual", "年平均", "#111111", 2.8, "-"),
-        ("sst_jan", "1 月", "#2E6DB4", 1.8, "-"),
-        ("sst_jul", "7 月", "#C0392B", 1.8, "-"),
-    ]
-    for col, label, color, lw, ls in series:
-        values = np.where(usable, df[col].to_numpy(dtype=float), np.nan)
-        ax.plot(values, lat, color=color, lw=lw, ls=ls, label=label, zorder=3)
 
-    valid_values = np.concatenate(
-        [np.where(usable, df[col].to_numpy(dtype=float), np.nan) for col, *_ in series]
-    )
-    ax.set_xlim(np.floor(np.nanmin(valid_values)) - 0.6, np.ceil(np.nanmax(valid_values)) + 0.8)
-    ax.set_ylim(LAT_MIN - 0.8, LAT_MAX + 0.8)
+def load_basins(path: Path) -> dict[str, pd.DataFrame]:
+    """读取分海盆 CSV，容忍列名大小写、首列无名与额外列。"""
+    df = pd.read_csv(path)
+    basin_col = None
+    for col in df.columns:
+        if str(col).strip().lower() == "basin":
+            basin_col = col
+            break
+    if basin_col is None:
+        first = df.columns[0]
+        values = df[first].astype(str).str.strip().str.lower()
+        known = set(BASIN_STYLE)
+        if values.isin(known).mean() > 0.5:
+            basin_col = first
+    if basin_col is None:
+        raise SystemExit(f"{path} 中找不到 basin 列（现有列：{list(df.columns)[:5]}…）")
+    df[basin_col] = df[basin_col].astype(str).str.strip().str.lower()
+    return {name: group.reset_index(drop=True) for name, group in df.groupby(basin_col, sort=False)}
+
+
+def load_summary_means(path: Path) -> dict[str, float]:
+    """从 summary_metrics.json 里尽力读取各海盆 cosφ 加权均温，字段名不固定。"""
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    basins = data.get("basins") if isinstance(data, dict) else None
+    if not isinstance(basins, dict):
+        return {}
+    keys = ("mean_sst_cos_weighted", "mean_sst", "sst_mean", "basin_mean", "annual_mean", "mean")
+    out: dict[str, float] = {}
+    for name, info in basins.items():
+        value = None
+        if isinstance(info, (int, float)):
+            value = float(info)
+        elif isinstance(info, dict):
+            for key in keys:
+                if isinstance(info.get(key), (int, float)):
+                    value = float(info[key])
+                    break
+        if value is not None and np.isfinite(value):
+            out[str(name).strip().lower()] = value
+    return out
+
+
+def coverage_ok(frame: pd.DataFrame, cov_min: float) -> np.ndarray:
+    if "coverage" in frame:
+        cov = frame["coverage"].to_numpy(dtype=float)
+    else:
+        cov = frame["valid_count"].to_numpy(dtype=float) / N_LON_GLOBAL
+    return np.isfinite(cov) & (cov >= cov_min)
+
+
+def frame_coverage(frame: pd.DataFrame) -> np.ndarray:
+    if "coverage" in frame:
+        return frame["coverage"].to_numpy(dtype=float)
+    return frame["valid_count"].to_numpy(dtype=float) / N_LON_GLOBAL
+
+
+# --------------------------------------------------------------------------- #
+# 数据定位：真实数据 vs fixture
+# --------------------------------------------------------------------------- #
+def resolve_inputs(force_fixture: bool, refresh_fixture: bool) -> dict:
+    missing = [p.name for p in (GLOBAL_CSV, BASINS_CSV, GRID_NPZ) if not p.exists()]
+    use_fixture = force_fixture or bool(missing)
+    if use_fixture:
+        if not force_fixture:
+            print(f"真实数据未就绪（缺少：{', '.join(missing)}），使用 fixture。", flush=True)
+        else:
+            print("按 --fixture 强制使用 fixture。", flush=True)
+        need_build = refresh_fixture or not (FIXTURE_DIR / "zonal_mean_global.csv").exists()
+        if need_build:
+            from make_fixture import build_fixture  # 延迟导入，避免真实模式多余开销
+
+            print(f"生成合成 fixture -> {FIXTURE_DIR}", flush=True)
+            build_fixture(FIXTURE_DIR)
+        print("注意：以下图件全部基于合成数据，仅用于开发自测，不是观测结果。", flush=True)
+        return {
+            "mode": "fixture",
+            "global_csv": FIXTURE_DIR / "zonal_mean_global.csv",
+            "basins_csv": FIXTURE_DIR / "zonal_mean_basins.csv",
+            "grid_npz": FIXTURE_DIR / "climatology_grid.npz",
+            "mask_npz": FIXTURE_DIR / "basin_mask.npz",
+            "summary_json": FIXTURE_DIR / "summary_metrics.json",
+            "out_dir": DEV_FIG_DIR,
+            "synthetic": True,
+        }
+
+    print("真实数据就绪：使用 data/ 下的全球结果。", flush=True)
+    return {
+        "mode": "real",
+        "global_csv": GLOBAL_CSV,
+        "basins_csv": BASINS_CSV,
+        "grid_npz": GRID_NPZ,
+        "mask_npz": MASK_NPZ,
+        "summary_json": SUMMARY_JSON,
+        "out_dir": FIG_DIR,
+        "synthetic": False,
+    }
+
+
+def finalize(fig: plt.Figure, ctx: dict, name: str, dpi: int = DPI) -> Path:
+    if ctx["synthetic"]:
+        add_synthetic_watermark(fig)
+    path = ctx["out_dir"] / name
+    save_png(fig, path, dpi=dpi)
+    return path
+
+
+# --------------------------------------------------------------------------- #
+# 图 1：全球纬向平均廓线 + 覆盖率面板
+# --------------------------------------------------------------------------- #
+def plot_global_profile(ctx: dict, cov_min: float) -> Path:
+    df = pd.read_csv(ctx["global_csv"])
+    lat = df["latitude"].to_numpy(dtype=float)
+    coverage = frame_coverage(df)
+    annual = df["sst_annual"].to_numpy(dtype=float)
+    usable = np.isfinite(annual) & (coverage >= cov_min)
+
+    fig = plt.figure(figsize=(12.0, 7.6))
+    gs = fig.add_gridspec(1, 2, width_ratios=[4.4, 1.05], wspace=0.06)
+    ax = fig.add_subplot(gs[0, 0])
+    axc = fig.add_subplot(gs[0, 1], sharey=ax)
+    axc.sharey(ax)
+
+    shaded_bad_latitudes(ax, lat, ~usable, cov_min)
+    shaded_bad_latitudes(axc, lat, ~usable, cov_min, label=False)
+
+    series = [
+        ("sst_annual", "年平均", "#111111", 2.8, "-", 3),
+        ("sst_jan", "1 月", "#2E6DB4", 1.8, "-", 2),
+        ("sst_jul", "7 月", "#C0392B", 1.8, "-", 2),
+    ]
+    valid_values: list[np.ndarray] = []
+    for col, label, color, lw, ls, zorder in series:
+        values = df[col].to_numpy(dtype=float)
+        masked = np.where(usable & np.isfinite(values), values, np.nan)
+        valid_values.append(masked)
+        ax.plot(masked, lat, color=color, lw=lw, ls=ls, label=label, zorder=zorder)
+
+    stacked = np.concatenate(valid_values)
+    ax.set_xlim(np.floor(np.nanmin(stacked)) - 0.8, np.ceil(np.nanmax(stacked)) + 1.4)
+    ax.set_ylim(LAT_MIN - 1.0, LAT_MAX + 1.0)
 
     ax.set_xlabel("海表温度 SST（°C）")
     ax.set_ylabel("纬度")
     ax.yaxis.set_major_formatter(FuncFormatter(lat_formatter))
-    ax.set_yticks(np.arange(-40, 31, 10))
+    ax.set_yticks(np.arange(-90, 91, 30))
     ax.grid(True, ls=":", lw=0.8, alpha=0.55)
     ax.set_axisbelow(True)
-    ax.axvline(25.0, color="0.35", ls="--", lw=1.0, alpha=0.85, zorder=2)
-    ax.text(25.15, LAT_MIN + 0.5, "25 °C", color="0.30", fontsize=9, rotation=90, va="bottom")
-    ax.legend(loc="lower right", framealpha=0.92, fontsize=10)
-    ax.set_title("印度洋纬向平均海表温度随纬度变化\n（2016–2020 气候态，20°E–120°E）", fontsize=13)
+    ax.axvline(ISOTHERM_LEVEL, color="0.35", ls="--", lw=1.0, alpha=0.85, zorder=2)
+    ax.text(ISOTHERM_LEVEL + 0.25, LAT_MIN + 1.5, "25 °C", color="0.30", fontsize=9, rotation=90, va="bottom")
 
-    if iso_list:
-        iso = iso_list[-1]
-        ax.plot(25.0, iso, "o", ms=6.5, color="#6A3D9A", zorder=5)
+    # 年均 25 °C 等温线：同时标出南、北半球交点（旧版只取 [-1] 会漏掉北半球）
+    iso = isotherm_crossings(lat[usable], annual[usable])
+    pos = [c for c in iso if c > 0]
+    neg = [c for c in iso if c < 0]
+    picks: list[float] = []
+    if pos:
+        picks.append(max(pos))
+    if neg:
+        picks.append(min(neg))
+    if len(picks) < 2:  # 极端情况下补上剩余交点
+        picks = picks or iso[:2]
+    if iso:
+        print(f"  年均 {ISOTHERM_LEVEL:.0f} °C 等温线交点（南北半球同时标注）："
+              + "、".join(f"{c:.2f}°{'N' if c >= 0 else 'S'}" for c in picks), flush=True)
+    else:
+        print(f"  年均 {ISOTHERM_LEVEL:.0f} °C 等温线：数据范围内无交点", flush=True)
+    for c in picks:
+        ax.plot(ISOTHERM_LEVEL, c, "o", ms=6.5, color="#6A3D9A", zorder=5)
         ax.annotate(
-            f"年均 25 °C 等温线\n{abs(iso):.2f}°{'N' if iso >= 0 else 'S'}",
-            xy=(25.0, iso),
-            xytext=(25.6, 5.0),
-            fontsize=9,
+            f"年均 25 °C 等温线\n{abs(c):.2f}°{'N' if c >= 0 else 'S'}",
+            xy=(ISOTHERM_LEVEL, c),
+            xytext=(ISOTHERM_LEVEL + 1.0, c + (7.0 if c >= 0 else -7.0)),
+            fontsize=8.6,
             color="#4A2A6A",
             arrowprops={"arrowstyle": "->", "color": "#6A3D9A", "lw": 1.0},
             bbox={"boxstyle": "round,pad=0.25", "fc": "white", "ec": "#6A3D9A", "alpha": 0.9},
             zorder=6,
         )
 
-    # 覆盖率面板
+    ax.legend(loc="lower right", framealpha=0.92, fontsize=10)
+    subtitle = "合成数据（fixture）" if ctx["synthetic"] else "2016–2020 气候态，0.25° 原生格点"
+    ax.set_title(f"全球纬向平均海表温度随纬度变化\n（{subtitle}，90°S–90°N）", fontsize=13)
+
+    # 覆盖率面板（分母固定 1440）
     axc.fill_betweenx(lat, 0, coverage * 100, color="#7FA6C9", alpha=0.55, lw=0)
     axc.plot(coverage * 100, lat, color="#2E6DB4", lw=1.3, zorder=3)
-    axc.axvline(COVERAGE_MIN * 100, color="#C0392B", ls="--", lw=1.1)
+    axc.axvline(cov_min * 100, color="#C0392B", ls="--", lw=1.1)
     axc.set_xlim(0, 100)
     axc.set_xticks([0, 50, 100])
     axc.tick_params(axis="x", labelsize=9)
@@ -184,13 +429,11 @@ def plot_profiles(df: pd.DataFrame) -> Path:
     axc.set_axisbelow(True)
     plt.setp(axc.get_yticklabels(), visible=False)
 
-    band_cov = coverage[(lat >= 20) & (lat <= 26)]
-    band_lat = lat[(lat >= 20) & (lat <= 26)]
-    idx = int(np.argmin(band_cov))
+    eq = np.abs(lat) <= 1.0
     axc.annotate(
-        f"20–26°N 最低\n{band_cov[idx] * 100:.1f}%",
-        xy=(max(band_cov[idx] * 100, 2), band_lat[idx]),
-        xytext=(38, band_lat[idx] + 1.5),
+        f"赤道附近\n{coverage[eq].mean() * 100:.1f}%",
+        xy=(max(coverage[eq].mean() * 100, 2), 0.0),
+        xytext=(38, 14),
         fontsize=8,
         color="#8E2F2F",
         arrowprops={"arrowstyle": "->", "color": "#8E2F2F", "lw": 0.9},
@@ -200,27 +443,178 @@ def plot_profiles(df: pd.DataFrame) -> Path:
         0.01,
         0.005,
         "注：纬向平均为同一纬度圈内有效海洋格点（非陆地/海冰）的算术平均，未乘 cosφ；\n"
-        "覆盖率 = 有效格点数 / 401（0.25° 原生经度格点）。北端约 26°N 以北陆地与半封闭海域多，"
-        "有效格点太少，曲线不绘制。",
+        f"覆盖率 = 有效格点数 / {N_LON_GLOBAL}（0.25° 全球经度格点）；覆盖率 < {cov_min:.0%} 的纬度不绘制曲线。",
         fontsize=8.5,
         color="0.35",
         va="bottom",
     )
-
-    path = FIG_DIR / "sst_vs_latitude.png"
-    save_png(fig, path)
-    return path
+    return finalize(fig, ctx, "global_sst_vs_latitude.png")
 
 
-def plot_heatmap(df: pd.DataFrame) -> Path:
+# --------------------------------------------------------------------------- #
+# 图 2：五大洋分盆对比 + 旧印度洋结果
+# --------------------------------------------------------------------------- #
+def plot_basins(ctx: dict, cov_min: float) -> Path:
+    basins = load_basins(ctx["basins_csv"])
+    summary_means = load_summary_means(ctx["summary_json"])
+    names = [n for n in BASIN_ORDER if n in basins]
+    names += [n for n in basins if n not in names and n != "global"]
+
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(14.4, 7.4))
+    mean_text: list[str] = []
+
+    for name in names:
+        frame = basins[name]
+        style = BASIN_STYLE.get(name, {"label": name, "color": None})
+        lat = frame["latitude"].to_numpy(dtype=float)
+        sst = frame["sst_annual"].to_numpy(dtype=float)
+        usable = coverage_ok(frame, cov_min) & np.isfinite(sst)
+        ax.plot(np.where(usable, sst, np.nan), lat, color=style["color"], lw=2.0, label=style["label"])
+        mean = summary_means.get(name)
+        if mean is None:
+            mean = basin_mean_cos(lat, sst, frame_coverage(frame), cov_min)
+        if mean is not None:
+            mean_text.append(f"{style['label']} {mean:.2f} °C")
+
+        # 1 月 / 7 月：实线 / 虚线（同色）
+        for col, ls, alpha in (("sst_jan", "-", 0.95), ("sst_jul", "--", 0.75)):
+            if col not in frame:
+                continue
+            values = frame[col].to_numpy(dtype=float)
+            ok = coverage_ok(frame, cov_min) & np.isfinite(values)
+            ax2.plot(np.where(ok, values, np.nan), lat, color=style["color"], lw=1.25, ls=ls, alpha=alpha)
+
+    # 旧印度洋结果（仓库已提交的真实数据）作为对照
+    if INDIAN_CSV.exists():
+        old = pd.read_csv(INDIAN_CSV)
+        lat_old = old["latitude"].to_numpy(dtype=float)
+        sst_old = old["sst_annual"].to_numpy(dtype=float)
+        cov_old = frame_coverage(old)
+        ok = np.isfinite(sst_old) & (cov_old >= cov_min)
+        ax.plot(np.where(ok, sst_old, np.nan), lat_old, color="#7F8C8D", lw=2.0, ls=(0, (5, 2)),
+                label="印度洋（旧结果 20°E–120°E/40°S–30°N）")
+
+    for axis in (ax, ax2):
+        axis.set_ylim(LAT_MIN - 1.0, LAT_MAX + 1.0)
+        axis.set_yticks(np.arange(-90, 91, 30))
+        axis.yaxis.set_major_formatter(FuncFormatter(lat_formatter))
+        axis.grid(True, ls=":", lw=0.8, alpha=0.55)
+        axis.set_axisbelow(True)
+        axis.set_xlabel("海表温度 SST（°C）")
+        axis.set_ylabel("纬度")
+        axis.axvline(ISOTHERM_LEVEL, color="0.55", ls=":", lw=0.9)
+
+    ax.set_title("五大洋年均 SST–纬度廓线\n（0.25° 原生格点，覆盖率 ≥ 10% 的纬度）", fontsize=12.5)
+    ax.legend(loc="lower right", framealpha=0.93, fontsize=9)
+    if mean_text:
+        ax.text(
+            0.015,
+            0.985,
+            "cosφ 加权均温：\n" + "\n".join(mean_text),
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            fontsize=8.4,
+            bbox={"boxstyle": "round,pad=0.3", "fc": "white", "ec": "0.7", "alpha": 0.9},
+        )
+
+    ax2.set_title("分海盆 1 月（实线）与 7 月（虚线）\n南北半球季节反相", fontsize=12.5)
+    proxy = [
+        Line2D([0], [0], color="0.3", lw=1.4, ls="-", label="1 月"),
+        Line2D([0], [0], color="0.3", lw=1.4, ls="--", label="7 月"),
+    ]
+    ax2.legend(handles=proxy, loc="lower right", framealpha=0.93, fontsize=9)
+
+    note = (
+        "注：分海盆边界为近似划分（印度洋 20°E–120°E，太平洋 120°E–280°E，其余归大西洋；"
+        "66°N 以北为北冰洋，60°S 以南为南大洋）。"
+        "分盆 coverage 的分母是该纬度该海盆的海洋格点数（数据侧提供 ocean_grid_count 时）。"
+    )
+    if ctx["synthetic"]:
+        note += "\n本图海盆曲线为合成 fixture；灰色点划线「印度洋（旧结果）」来自仓库已提交的真实 CSV。"
+    fig.text(0.01, 0.005, note, fontsize=8.3, color="0.35", va="bottom")
+    return finalize(fig, ctx, "basins_sst_vs_latitude.png")
+
+
+# --------------------------------------------------------------------------- #
+# 图 3：全球年均 SST 地图
+# --------------------------------------------------------------------------- #
+def plot_map(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
+    with np.load(ctx["grid_npz"]) as npz:
+        lat = npz["lat"].astype(float)
+        lon = npz["lon"].astype(float)
+        annual = npz["sst_annual"].astype(float)
+    if annual.shape != (len(lat), len(lon)):
+        raise SystemExit(f"climatology_grid.npz 形状异常：{annual.shape} vs lat×lon")
+
+    cmap = matplotlib.colormaps["RdYlBu_r"].copy()
+    cmap.set_bad("#E6E6E6")
+    fig, ax = plt.subplots(figsize=(13.2, 6.8))
+    mesh = ax.pcolormesh(
+        lon,
+        lat,
+        np.ma.masked_invalid(annual),
+        shading="nearest",
+        cmap=cmap,
+        vmin=-2.0,
+        vmax=32.0,
+        rasterized=True,
+    )
+    cb = fig.colorbar(mesh, ax=ax, pad=0.012, aspect=28)
+    cb.set_label("海表温度 SST（°C）", fontsize=11)
+    cb.set_ticks([-2, 4, 10, 16, 22, 28, 32])
+
+    cs = ax.contour(lon, lat, np.ma.masked_invalid(annual), levels=[ISOTHERM_LEVEL],
+                    colors="black", linewidths=1.0)
+    ax.clabel(cs, fmt="25 °C", fontsize=8)
+
+    boundary_note = "未叠加海盆边界（basin_mask.npz 不存在）"
+    if ctx["mask_npz"].exists():
+        with np.load(ctx["mask_npz"]) as npz:
+            basin_id = npz["basin_id"]
+        if basin_id.shape == annual.shape:
+            step = 4
+            levels = np.arange(-0.5, 5.0, 1.0)
+            ax.contour(lon[::step], lat[::step], basin_id[::step, ::step],
+                       levels=levels, colors="0.25", linewidths=0.35, alpha=0.8)
+            boundary_note = "细线为近似海盆边界与海岸线"
+        else:
+            boundary_note = "basin_mask.npz 形状不匹配，未画边界"
+
+    ax.set_xlim(0, 360)
+    ax.set_ylim(LAT_MIN, LAT_MAX)
+    ax.set_xticks(np.arange(0, 361, 60))
+    ax.set_xticklabels([f"{v:.0f}°" for v in np.arange(0, 361, 60)])
+    ax.set_yticks(np.arange(-90, 91, 30))
+    ax.yaxis.set_major_formatter(FuncFormatter(lat_formatter))
+    ax.set_xlabel("经度")
+    ax.set_ylabel("纬度")
+    subtitle = "合成数据（fixture）" if ctx["synthetic"] else "2016–2020 气候态"
+    ax.set_title(f"全球年平均海表温度（0.25° 等经纬网格）\n（{subtitle}，黑色等值线 = 25 °C，灰色 = 陆地/海冰）", fontsize=13)
+    ax.set_facecolor("#E6E6E6")
+
+    fig.text(
+        0.01,
+        0.005,
+        "注：未引入 cartopy，采用等经纬（Plate Carrée）投影的 pcolormesh；"
+        f"色标固定 −2～32 °C；{boundary_note}。",
+        fontsize=8.4,
+        color="0.35",
+        va="bottom",
+    )
+    return finalize(fig, ctx, "global_sst_map.png", dpi=180)
+
+
+def plot_heatmap(ctx: dict, cov_min: float) -> Path:
+    df = pd.read_csv(ctx["global_csv"])
     lat = df["latitude"].to_numpy(dtype=float)
-    coverage = df["coverage"].to_numpy(dtype=float)
-    usable = coverage >= COVERAGE_MIN
+    coverage = frame_coverage(df)
+    usable = coverage >= cov_min
     months = np.arange(1, 13)
     data = np.vstack([df[f"sst_{m:02d}"].to_numpy(dtype=float) for m in months])
     masked = np.ma.masked_array(data, mask=(~np.isfinite(data)) | ~usable[None, :])
 
-    fig, ax = plt.subplots(figsize=(11.6, 6.6))
+    fig, ax = plt.subplots(figsize=(12.4, 6.8))
     cmap = matplotlib.colormaps["RdYlBu_r"].copy()
     cmap.set_bad("#D9D9D9")
     filled = np.asarray(masked.filled(np.nan), dtype=float)
@@ -230,37 +624,178 @@ def plot_heatmap(df: pd.DataFrame) -> Path:
     cb = fig.colorbar(mesh, ax=ax, pad=0.015, aspect=30)
     cb.set_label("海表温度 SST（°C）")
 
-    cs = ax.contour(lat, months, masked, levels=[25.0], colors="black", linewidths=0.9)
+    cs = ax.contour(lat, months, masked, levels=[ISOTHERM_LEVEL], colors="black", linewidths=0.9)
     ax.clabel(cs, fmt="25 °C", fontsize=8)
 
     ax.set_xlim(LAT_MIN - 0.125, LAT_MAX + 0.125)
     ax.set_ylim(12.5, 0.5)
     ax.set_yticks(months)
     ax.set_yticklabels([f"{m} 月" for m in months])
-    ax.set_xticks(np.arange(-40, 31, 10))
+    ax.set_xticks(np.arange(-90, 91, 30))
     ax.xaxis.set_major_formatter(FuncFormatter(lat_formatter))
     ax.set_xlabel("纬度")
     ax.set_ylabel("月份")
-    ax.set_title("印度洋纬向平均海表温度：月份 × 纬度\n（2016–2020 气候态，20°E–120°E，空白/灰色 = 覆盖率 < 10%）", fontsize=13)
+    subtitle = "合成数据（fixture）" if ctx["synthetic"] else "2016–2020 气候态"
+    ax.set_title(f"全球纬向平均海表温度：月份 × 纬度\n（{subtitle}，90°S–90°N，灰色 = 覆盖率 < {cov_min:.0%}）", fontsize=13)
     ax.grid(True, ls=":", lw=0.7, alpha=0.5, color="0.4")
     ax.set_axisbelow(True)
     for spine in ax.spines.values():
         spine.set_linewidth(0.6)
 
-    path = FIG_DIR / "lat_month_heatmap.png"
-    save_png(fig, path)
-    return path
+    fig.text(
+        0.01,
+        0.005,
+        "注：每格为该纬度圈 12 个月气候态；12 个月等权平均得年均；"
+        "覆盖率不足的纬度置灰，不参与曲线与结论。",
+        fontsize=8.4,
+        color="0.35",
+        va="bottom",
+    )
+    return finalize(fig, ctx, "lat_month_heatmap.png")
+
+
+# --------------------------------------------------------------------------- #
+# 图 4：印度洋旧廓线 vs 全球廓线 + 差值
+# --------------------------------------------------------------------------- #
+def plot_indian_vs_global(ctx: dict, cov_min: float) -> Path:
+    if not INDIAN_CSV.exists():
+        raise SystemExit(f"缺少 {INDIAN_CSV}，无法做印度洋回归对照")
+    old = pd.read_csv(INDIAN_CSV)
+    glob = pd.read_csv(ctx["global_csv"])
+    lat_old = old["latitude"].to_numpy(dtype=float)
+    lat_glob = glob["latitude"].to_numpy(dtype=float)
+    sst_old = old["sst_annual"].to_numpy(dtype=float)
+    sst_glob = glob["sst_annual"].to_numpy(dtype=float)
+    ok_old = np.isfinite(sst_old) & (frame_coverage(old) >= cov_min)
+    ok_glob = np.isfinite(sst_glob) & (frame_coverage(glob) >= cov_min)
+
+    # 全球廓线插值到印度洋纬度，仅用于重叠区差值
+    common = (lat_glob >= lat_old.min()) & (lat_glob <= lat_old.max())
+    lat_c = lat_glob[common]
+    sst_c = sst_glob[common]
+    ok_c = ok_glob[common]
+    diff = sst_old - np.interp(lat_old, lat_c[ok_c], sst_c[ok_c]) if ok_c.any() else np.full_like(lat_old, np.nan)
+    ok_diff = ok_old & np.isfinite(diff)
+
+    fig = plt.figure(figsize=(11.8, 8.6))
+    gs = fig.add_gridspec(2, 1, height_ratios=[2.5, 1.0], hspace=0.08)
+    ax = fig.add_subplot(gs[0, 0])
+    axd = fig.add_subplot(gs[1, 0], sharex=ax)
+
+    ax.plot(np.where(ok_glob, sst_glob, np.nan), lat_glob, color="#111111", lw=2.0, label="全球（90°S–90°N）")
+    ax.plot(np.where(ok_old, sst_old, np.nan), lat_old, color="#E67E22", lw=2.2,
+            label="印度洋（旧结果）")
+    ax.set_ylabel("纬度")
+    ax.yaxis.set_major_formatter(FuncFormatter(lat_formatter))
+    ax.set_yticks(np.arange(-90, 91, 30))
+    ax.set_ylim(LAT_MIN - 1.0, LAT_MAX + 1.0)
+    ax.grid(True, ls=":", lw=0.8, alpha=0.55)
+    ax.set_axisbelow(True)
+    ax.axvline(ISOTHERM_LEVEL, color="0.5", ls=":", lw=0.9)
+    subtitle = "合成全球曲线（fixture）" if ctx["synthetic"] else "全球 2016–2020 气候态"
+    ax.set_title(f"印度洋（旧结果）与全球年均 SST 廓线对照\n（{subtitle}；印度洋为 20°E–120°E/40°S–30°N）", fontsize=12.5)
+    ax.legend(loc="lower right", framealpha=0.93, fontsize=9)
+    ax.tick_params(labelbottom=False)
+
+    axd.axhline(0.0, color="0.5", lw=0.9)
+    axd.plot(np.where(ok_diff, diff, np.nan), lat_old, color="#7D3C98", lw=1.8)
+    axd.fill_betweenx(lat_old, 0, np.where(ok_diff, diff, np.nan), color="#BB8FCE", alpha=0.3, lw=0)
+    axd.set_ylabel("差值（°C）", fontsize=9)
+    axd.set_xlabel("纬度")
+    axd.xaxis.set_major_formatter(FuncFormatter(lat_formatter))
+    axd.set_xlim(LAT_MIN - 1.0, LAT_MAX + 1.0)
+    axd.set_xticks(np.arange(-90, 91, 30))
+    axd.grid(True, ls=":", lw=0.8, alpha=0.55)
+    axd.set_axisbelow(True)
+    axd.set_title("印度洋 − 全球（重叠纬度，正值 = 印度洋更暖）", fontsize=9.5, pad=4)
+
+    fig.text(
+        0.01,
+        0.005,
+        "注：旧印度洋结果来自仓库已提交的 data/zonal_mean.csv（281 行，0.25°）；"
+        "全球曲线覆盖 90°S–90°N。差值只在两者均有有效值且覆盖率 ≥ "
+        f"{cov_min:.0%} 的纬度计算。",
+        fontsize=8.3,
+        color="0.35",
+        va="bottom",
+    )
+    return finalize(fig, ctx, "indian_vs_global.png")
+
+
+# --------------------------------------------------------------------------- #
+# 印度洋回归自检（证明全球版没有改变旧口径）
+# --------------------------------------------------------------------------- #
+def indian_regression_check() -> dict:
+    if not INDIAN_CSV.exists():
+        raise SystemExit(f"缺少 {INDIAN_CSV}，无法做印度洋回归自检")
+    df = pd.read_csv(INDIAN_CSV)
+    lat = df["latitude"].to_numpy(dtype=float)
+    cov = frame_coverage(df)
+    annual = df["sst_annual"].to_numpy(dtype=float)
+    usable = np.isfinite(annual) & (cov >= DEFAULT_COVERAGE_MIN)
+
+    i_max = int(np.nanargmax(np.where(usable, annual, -np.inf)))
+    isos = isotherm_crossings(lat[usable], annual[usable])
+    iso_south = min(isos) if isos else float("nan")
+    mean = basin_mean_cos(lat, annual, cov, DEFAULT_COVERAGE_MIN)
+    measured = {
+        "sst_max": float(annual[i_max]),
+        "lat_max": float(abs(lat[i_max])) * (1 if lat[i_max] >= 0 else -1),
+        "isotherm_south": iso_south,
+        "basin_mean": float(mean) if mean is not None else float("nan"),
+    }
+    print("印度洋回归自检（data/zonal_mean.csv，281 行）：", flush=True)
+    failures: list[str] = []
+    for key, (expected, tol) in INDIAN_BASELINE.items():
+        got = measured[key]
+        ok = np.isfinite(got) and abs(got - expected) <= tol
+        if not ok:
+            failures.append(f"{key}: 实测 {got:.4f} vs README {expected}")
+        print(f"  {key:<15s} 实测 {got:8.3f}   期望 {expected:8.3f} ± {tol}   {'OK' if ok else 'FAIL'}",
+              flush=True)
+    print(f"  纬度=2.12°N、25 °C 等温线 21.66°S、海盆均值 26.16 °C 三项口径未变。", flush=True)
+    if failures:
+        raise SystemExit("印度洋回归失败：\n  " + "\n  ".join(failures))
+    return measured
+
+
+# --------------------------------------------------------------------------- #
+# 入口
+# --------------------------------------------------------------------------- #
+FIGURES = {
+    "profile": plot_global_profile,
+    "basins": plot_basins,
+    "map": plot_map,
+    "heatmap": plot_heatmap,
+    "indian": plot_indian_vs_global,
+}
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="绘制全球 SST–纬度 图件（真实数据缺失时自动用 fixture）")
+    parser.add_argument("--coverage-min", type=float, default=DEFAULT_COVERAGE_MIN,
+                        help="绘图覆盖率阈值（默认 0.10）")
+    parser.add_argument("--fixture", action="store_true", help="强制使用 .tmp/fixture 合成数据")
+    parser.add_argument("--refresh-fixture", action="store_true", help="重新生成合成 fixture")
+    parser.add_argument("--figures", default="", help="只画指定图，逗号分隔：profile,basins,map,heatmap,indian")
+    args = parser.parse_args()
+
+    cov_min = float(args.coverage_min)
+    if not 0.0 < cov_min <= 1.0:
+        raise SystemExit("--coverage-min 必须在 (0, 1] 内")
+
     setup_chinese_font()
-    if not ZONAL_CSV.exists():
-        raise SystemExit(f"未找到 {ZONAL_CSV}，请先运行 scripts/compute.py")
-    df = pd.read_csv(ZONAL_CSV)
-    print(f"读取 {ZONAL_CSV.name}：{len(df)} 行", flush=True)
-    FIG_DIR.mkdir(parents=True, exist_ok=True)
-    plot_profiles(df)
-    plot_heatmap(df)
+    ctx = resolve_inputs(args.fixture, args.refresh_fixture)
+    indian_regression_check()
+
+    wanted = [k.strip() for k in args.figures.split(",") if k.strip()] or list(FIGURES)
+    unknown = [k for k in wanted if k not in FIGURES]
+    if unknown:
+        raise SystemExit(f"未知图名：{unknown}，可选 {list(FIGURES)}")
+    print(f"输出目录：{ctx['out_dir']}", flush=True)
+    for key in wanted:
+        FIGURES[key](ctx, cov_min)
+    print(f"完成：{len(wanted)} 张图（模式：{ctx['mode']}）。", flush=True)
     return 0
 
 
