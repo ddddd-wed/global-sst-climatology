@@ -4,7 +4,7 @@
 
 复核内容
 --------
-1. **数值复算**：读取 ``data/raw/``（或 ``--raw-dir``）下 60 个 ``sst_YYYY_MM.csv.gz``，独立重算纬向平均，
+1. **数值复算**：读取 ``data/raw_global/``（或 ``--raw-dir``）下 60 个 ``sst_YYYY_MM.csv.gz``，独立重算纬向平均，
    抽 8 个纬度 × 1 月/7 月两个月份，与 ``zonal_mean_basins.csv`` 的 global 行**按纬度**对齐到 0.01 °C；
    统计域用 ``basin_mask.npz::basin_mask`` 剔除内陆湖泊（SST 均值仍独立计算）。
 2. **结构性检查**：720 行、0.25° 步长、纬度单调，``coverage = valid_count/ocean_grid_count``、
@@ -49,7 +49,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = ROOT / "data"
-DEFAULT_RAW_DIR = DEFAULT_DATA_DIR / "raw"
+DEFAULT_RAW_DIR = DEFAULT_DATA_DIR / "raw_global"   # 全球 raw；旧 data/raw 只服务印度洋回归
 INDIAN_CSV = ROOT / "data" / "zonal_mean.csv"
 
 N_LAT_GLOBAL = 720
@@ -709,6 +709,12 @@ def recompute_zonal_from_raw(
     return lat_ref, clim, annual, count_stack
 
 
+def probe_raw_grid(path: Path) -> tuple[int, int]:
+    """快速读取首个 raw 文件，返回 (纬度格点数, 经度格点数)。"""
+    df = read_raw_csv(path)
+    return int(df["latitude"].nunique()), int(df["longitude"].nunique())
+
+
 def check_raw_recompute(
     raw_dir: Path,
     target_df: pd.DataFrame | None,
@@ -720,6 +726,18 @@ def check_raw_recompute(
     files = list_raw_files(raw_dir)
     if not files:
         return make_check(name, "skip", f"未找到 {raw_dir}/sst_YYYY_MM.csv.gz，跳过数值复算")
+    try:
+        grid_shape = probe_raw_grid(files[0][1])
+    except Exception as exc:  # noqa: BLE001
+        return make_check(name, "fail", f"raw 读取失败：{exc}")
+    if grid_shape != (N_LAT_GLOBAL, N_LON_GLOBAL):
+        hint = "，疑似旧印度洋缓存" if grid_shape == (281, 401) else ""
+        return make_check(
+            name,
+            "skip",
+            f"raw 不是全球网格（{grid_shape[0]}×{grid_shape[1]}{hint}），"
+            "请用 --raw-dir 指向全球缓存",
+        )
     if len(files) != 60:
         return make_check(name, "skip", f"raw 只有 {len(files)} 个时次（需 60），数据未就绪，跳过数值复算")
     if target_df is None:
@@ -985,13 +1003,18 @@ def run(data_dir: Path, raw_dir: Path, report_path: Path, skip_online: bool) -> 
 def main() -> int:
     parser = argparse.ArgumentParser(description="独立复核全球 SST 分析结果（不依赖 compute.py）")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
-    parser.add_argument("--raw-dir", type=Path, default=None, help="默认 <data-dir>/raw")
+    parser.add_argument("--raw-dir", type=Path, default=None, help="默认 <data-dir>/raw_global")
     parser.add_argument("--report", type=Path, default=None, help="默认 <data-dir>/verify_report.json")
     parser.add_argument("--skip-online", action="store_true", help="跳过 ERDDAP 在线抽样")
     args = parser.parse_args()
 
     data_dir = args.data_dir
-    raw_dir = args.raw_dir if args.raw_dir is not None else data_dir / "raw"
+    if args.raw_dir is not None:
+        raw_dir = args.raw_dir
+    elif data_dir.resolve() == DEFAULT_DATA_DIR.resolve():
+        raw_dir = DEFAULT_RAW_DIR
+    else:
+        raw_dir = data_dir / "raw_global"
     report_path = args.report if args.report is not None else data_dir / "verify_report.json"
     report = run(data_dir, raw_dir, report_path, args.skip_online)
     return 1 if report["overall"] == "fail" else 0

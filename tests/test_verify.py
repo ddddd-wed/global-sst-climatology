@@ -13,6 +13,7 @@ import shutil
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -115,7 +116,8 @@ class TestRawRecompute(unittest.TestCase):
         np.testing.assert_allclose(annual, np.full(4, 6.55), atol=1e-12)
         np.testing.assert_allclose(counts[0], np.full(4, 2.0))
 
-    def test_full_60_timestep_check_passes(self) -> None:
+    @mock.patch.object(verify, "probe_raw_grid", return_value=(verify.N_LAT_GLOBAL, verify.N_LON_GLOBAL))
+    def test_full_60_timestep_check_passes(self, _probe) -> None:
         """用 60 个「720 纬圈 × 1 经度」的小文件跑通 check_raw_recompute 全流程。"""
         lats = np.round(verify.LAT_FIRST + verify.LAT_STEP * np.arange(verify.N_LAT_GLOBAL), 3)
         annual = 27.0 - 0.15 * np.abs(lats)
@@ -161,6 +163,63 @@ class TestRawRecompute(unittest.TestCase):
         result = verify.check_raw_recompute(raw_dir, target, "test::global")
         self.assertEqual(result["status"], "pass", result["detail"])
         self.assertLessEqual(result["metrics"]["max_abs_diff"], verify.NUMERIC_TOL)
+
+    def test_missing_default_raw_skips(self) -> None:
+        raw_dir = scratch_dir("no_raw") / "raw_global"  # 不创建
+        result = verify.check_raw_recompute(raw_dir, None, "test")
+        self.assertEqual(result["status"], "skip")
+        self.assertIn("未找到", result["detail"])
+
+    def test_old_indian_grid_skips(self) -> None:
+        """默认/显式指向 281×401 旧印度洋 raw 时跳过，而不是 FAIL。"""
+        lats = np.round(-39.875 + 0.25 * np.arange(281), 3)
+        lons = np.round(20.125 + 0.25 * np.arange(401), 3)
+        raw_dir = scratch_dir("legacy_raw") / "raw"
+        raw_dir.mkdir()
+        df = pd.DataFrame(
+            {
+                "time": "2016-01-16T12:00:00Z",
+                "zlev": 0.0,
+                "latitude": np.repeat(lats, len(lons)),
+                "longitude": np.tile(lons, len(lats)),
+                "sst": np.zeros(len(lats) * len(lons)),
+            }
+        )
+        path = raw_dir / "sst_2016_01.csv.gz"
+        with gzip.open(path, "wt", encoding="utf-8", newline="") as fh:
+            fh.write("time,zlev,latitude,longitude,sst\n")
+            fh.write("UTC,m,degrees_north,degrees_east,degree_Celsius\n")
+            fh.write(df.to_csv(index=False, header=False))
+        result = verify.check_raw_recompute(raw_dir, None, "test")
+        self.assertEqual(result["status"], "skip")
+        self.assertIn("281×401", result["detail"])
+        self.assertIn("旧印度洋缓存", result["detail"])
+
+    def test_global_grid_tampered_values_fail(self) -> None:
+        """显式全球网格时，若重算值与 CSV 不一致必须 FAIL（不因 raw 处理逻辑放过）。"""
+        lats = np.round(verify.LAT_FIRST + verify.LAT_STEP * np.arange(verify.N_LAT_GLOBAL), 3)
+        clim = np.full((12, len(lats)), 10.0)
+        annual = np.full(len(lats), 10.0)
+        counts = np.ones((60, len(lats)))
+        target = pd.DataFrame(
+            {
+                "latitude": lats,
+                "valid_count": np.full(len(lats), 1.0),
+                "coverage": np.ones(len(lats)),
+                "sst_annual": np.full(len(lats), 10.5),  # 人为篡改 +0.5
+                "sst_jan": np.full(len(lats), 10.5),
+                "sst_jul": np.full(len(lats), 10.5),
+            }
+        )
+        for m in range(1, 13):
+            target[f"sst_{m:02d}"] = 10.5
+        files = [((2016 + i // 12, i % 12 + 1), Path(f"dummy{i}.csv.gz")) for i in range(60)]
+        with mock.patch.object(verify, "list_raw_files", return_value=files), \
+                mock.patch.object(verify, "probe_raw_grid", return_value=(verify.N_LAT_GLOBAL, verify.N_LON_GLOBAL)), \
+                mock.patch.object(verify, "recompute_zonal_from_raw", return_value=(lats, clim, annual, counts)):
+            result = verify.check_raw_recompute(Path("synthetic_raw"), target, "test")
+        self.assertEqual(result["status"], "fail", result["detail"])
+        self.assertIn("Δ", result["detail"])
 
 
 
