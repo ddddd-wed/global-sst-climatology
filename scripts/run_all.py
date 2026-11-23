@@ -11,7 +11,7 @@
     python scripts/run_all.py --jobs 8
 
 任一步骤非零退出立即停止。验收口径为全球版：720 行 × 55 列、6 个海盆、720×1440 网格、
-8 张正式静态图、summary 字段与 verify.py 9 项无失败（ERDDAP 在线抽样/海冰 raw 不可用时可跳过并打印说明）；
+10 张正式静态图、summary 字段与 verify.py 11 项无失败（ERDDAP 在线抽样/海冰 raw 不可用时可跳过并打印说明）；
 并打印旧印度洋回归三项数值。
 """
 
@@ -60,6 +60,8 @@ FIGURES = [
     "global_sst_map_regions.png",
     "global_sst_map_mollweide.png",
     "global_sst_anomaly.png",
+    "global_warming_trend.png",
+    "ersst_vs_oisst_check.png",
     "lat_month_heatmap.png",
     "indian_vs_global.png",
 ]
@@ -174,12 +176,12 @@ def verify_outputs(report_path: Path) -> None:
     print(f"[5] {SUMMARY_JSON.name}：basins.global.mean_sst_cos_weighted = {value}")
     assert isinstance(value, (int, float)) and np.isfinite(value), "summary 均温字段异常"
 
-    # [6] verify 报告：9 项无失败（在线抽样/海冰 raw 不可用时允许 skip）
+    # [6] verify 报告：11 项无失败（在线抽样/海冰 raw 不可用时允许 skip）
     report = json.loads(report_path.read_text(encoding="utf-8"))
     counts = report["counts"]
     print(f"[6] verify.py：pass={counts['pass']} fail={counts['fail']} skip={counts['skip']}")
     assert counts["fail"] == 0, f"verify 存在失败项：{counts}"
-    assert counts["pass"] + counts["skip"] == 9, f"verify 检查项数异常：{counts}"
+    assert counts["pass"] + counts["skip"] == 11, f"verify 检查项数异常：{counts}"
     if counts["skip"]:
         skipped = "、".join(c["name"] for c in report["checks"] if c["status"] == "skip")
         print(f"    注意：{counts['skip']} 项被跳过（{skipped}），无失败项，视为通过。")
@@ -241,7 +243,7 @@ def main() -> int:
         ["--region", "global", "--raw-dir", str(raw_dir)]
         + (["--ice-dir", str(ice_dir)] if ice_dir else []),
     )
-    timings["绘图"] = run_step("绘制 8 张正式图", "plot.py")
+    timings["绘图"] = run_step("绘制 10 张正式图", "plot.py")
     timings["交互图"] = run_step("生成可缩放交互地图（HTML）", "make_map_viewer.py")
     timings["复核"] = run_step(
         "独立复核（60 时次 raw + 无冰 raw + ERDDAP 在线抽样）",

@@ -51,6 +51,7 @@ from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.ticker import FuncFormatter  # noqa: E402
 
 from map_labels import labels_in_bbox  # noqa: E402
+from compute_ersst import student_t_crit_95, student_t_two_sided_pvalue  # noqa: E402
 
 DATA_DIR = ROOT / "data"
 FIG_DIR = ROOT / "figures"
@@ -63,6 +64,10 @@ GRID_NPZ = DATA_DIR / "climatology_grid.npz"
 MASK_NPZ = DATA_DIR / "basin_mask.npz"
 SUMMARY_JSON = DATA_DIR / "summary_metrics.json"
 INDIAN_CSV = DATA_DIR / "zonal_mean.csv"
+ERSST_SERIES_CSV = DATA_DIR / "ersst_global_series.csv"
+ERSST_TREND_CSV = DATA_DIR / "ersst_trend.csv"
+ERSST_VS_OISST_CSV = DATA_DIR / "ersst_vs_oisst_2016_2020.csv"
+ERSST_SUMMARY_JSON = DATA_DIR / "ersst_summary.json"
 
 # 绘图门槛：海洋占比阈值（可配置常量，也支持 --coverage-min / 环境变量 SST_COVERAGE_MIN）
 DEFAULT_COVERAGE_MIN = float(os.environ.get("SST_COVERAGE_MIN", "0.10"))
@@ -1346,9 +1351,211 @@ def plot_indian_vs_global(ctx: dict, cov_min: float) -> Path:
     return finalize(fig, ctx, "indian_vs_global.png")
 
 
-# --------------------------------------------------------------------------- #
-# 印度洋回归自检（证明全球版没有改变旧口径）
-# --------------------------------------------------------------------------- #
+def _ols_with_ci(years: np.ndarray, values: np.ndarray) -> dict[str, float | np.ndarray]:
+    valid = np.isfinite(values)
+    x = years[valid].astype(float)
+    y = values[valid].astype(float)
+    n = len(x)
+    if n < 3:
+        raise ValueError("样本不足，无法拟合趋势")
+    slope, intercept = np.polyfit(x, y, 1)
+    fit = slope * x + intercept
+    resid = y - fit
+    ss_res = float(np.sum(resid ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    se = float(np.sqrt(ss_res / (n - 2) / np.sum((x - x.mean()) ** 2)))
+    tcrit = student_t_crit_95(n - 2)
+    p = student_t_two_sided_pvalue(abs(slope / se), n - 2) if se > 0 else 0.0
+    return {
+        "slope_per_year": float(slope),
+        "slope_per_decade": float(slope * 10.0),
+        "intercept": float(intercept),
+        "r2": float(r2),
+        "p_value": float(p),
+        "ci95_per_decade": float(tcrit * se * 10.0),
+        "n": float(n),
+        "x": x,
+        "y": y,
+        "fit": fit,
+        "se_fit": float(np.sqrt(ss_res / (n - 2))) * np.sqrt(
+            1.0 / n + (x - x.mean()) ** 2 / np.sum((x - x.mean()) ** 2)
+        ),
+        "tcrit": float(tcrit),
+    }
+
+
+def _assert_png_size(path: Path, expected: tuple[int, int]) -> None:
+    with open(path, "rb") as fh:
+        head = fh.read(24)
+    width, height = struct.unpack(">II", head[16:24])
+    if (width, height) != expected:
+        raise RuntimeError(f"{path.name} 尺寸 {width}×{height} != {expected[0]}×{expected[1]}")
+
+
+def plot_warming_trend(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path | None:
+    """ERSST v5 1982–2024 全球升温趋势 + 纬向趋势。"""
+    if not (ERSST_SERIES_CSV.exists() and ERSST_TREND_CSV.exists() and ERSST_SUMMARY_JSON.exists()):
+        print("  ERSST P3 数据未就绪，跳过 global_warming_trend.png", flush=True)
+        return None
+    series = pd.read_csv(ERSST_SERIES_CSV)
+    trend_df = pd.read_csv(ERSST_TREND_CSV)
+    summary = json.loads(ERSST_SUMMARY_JSON.read_text(encoding="utf-8"))
+    years = series["year"].to_numpy(float)
+    y = series["global_mean_sst"].to_numpy(float)
+    fit = _ols_with_ci(years, y)
+    expected = summary["global_trend_per_decade_c"]
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(24.0, 13.5),
+                                   gridspec_kw={"height_ratios": [1.25, 1.0]})
+    fig.subplots_adjust(left=0.065, right=0.975, bottom=0.09, top=0.93, hspace=0.38)
+
+    ax1.plot(years, y, "o-", color="#111111", lw=1.5, ms=3.2, label="全球年均 SST")
+    for col, color, label in (("nh_mean_sst", "#2E6DB4", "北半球"), ("sh_mean_sst", "#C0392B", "南半球")):
+        if col in series:
+            ax1.plot(years, series[col], color=color, lw=0.8, alpha=0.55, label=label)
+    xx = np.linspace(years.min(), years.max(), 300)
+    yy = fit["slope_per_year"] * xx + fit["intercept"]
+    ci = fit["tcrit"] * float(np.sqrt(np.sum((fit["y"] - fit["fit"]) ** 2) / (len(years) - 2))) * np.sqrt(
+        1.0 / len(years) + (xx - years.mean()) ** 2 / np.sum((years - years.mean()) ** 2)
+    )
+    ax1.fill_between(xx, yy - ci, yy + ci, color="#C0392B", alpha=0.18, lw=0, label="线性拟合 95% CI")
+    ax1.plot(xx, yy, color="#C0392B", lw=2.0, label="线性拟合")
+    warm = summary["warmest_year"]
+    cold = summary["coldest_year"]
+    for item, color in ((warm, "#C0392B"), (cold, "#2E6DB4")):
+        i = int(np.argmin(np.abs(years - item["year"])))
+        ax1.plot(years[i], y[i], "o", ms=8, mfc=color, mec="white", mew=1.2, zorder=5)
+        ax1.annotate(f"{item['year']}：{item['global_mean_sst_c']:.2f} °C",
+                     xy=(years[i], y[i]), xytext=(8, 14 if color == "#C0392B" else -18),
+                     textcoords="offset points", fontsize=10, color=color,
+                     bbox={"boxstyle": "round,pad=0.25", "fc": "white", "ec": color, "alpha": 0.9})
+    ax1.set_xlim(years.min() - 0.5, years.max() + 0.5)
+    ax1.set_xticks(np.arange(1982, 2026, 4))
+    ax1.set_xlabel("年份")
+    ax1.set_ylabel("全球年均 SST（°C）")
+    ax1.set_title("ERSST v5 全球年均 SST（1982–2024）与线性趋势", fontsize=15)
+    ax1.grid(True, ls=":", lw=0.8, alpha=0.55)
+    ax1.set_axisbelow(True)
+    ax1.legend(loc="lower right", fontsize=10, framealpha=0.92)
+    ax1.text(0.015, 0.97,
+             f"趋势 {expected['trend_per_decade_c']:+.4f} ± {expected['ci95_halfwidth_c_per_decade']:.4f} °C/十年\n"
+             f"R² = {expected['r2']:.3f}   p = {expected['p_value']:.1e}   n = {int(expected['n_years'])} 年",
+             transform=ax1.transAxes, va="top", ha="left", fontsize=12,
+             bbox={"boxstyle": "round,pad=0.35", "fc": "white", "ec": "0.6", "alpha": 0.92})
+
+    lat = trend_df["latitude"].to_numpy(float)
+    tr = trend_df["trend_per_decade"].to_numpy(float)
+    ci95 = trend_df["ci95_halfwidth"].to_numpy(float)
+    ok = np.isfinite(tr) & np.isfinite(ci95)
+    ax2.axhspan(60, 90, color="#8FB8D8", alpha=0.13, lw=0)
+    ax2.axhspan(-20, 20, color="#E8C27A", alpha=0.13, lw=0)
+    ax2.errorbar(tr[ok], lat[ok], xerr=ci95[ok], fmt="o-", color="#6A3D9A", ms=2.4,
+                 lw=1.0, ecolor="0.45", elinewidth=0.9, capsize=2, label="趋势 ±95% CI")
+    ax2.axvline(0, color="0.25", lw=1.0)
+    ax2.set_ylim(LAT_MIN - 1, LAT_MAX + 1)
+    ax2.set_yticks(np.arange(-90, 91, 30))
+    ax2.yaxis.set_major_formatter(FuncFormatter(lat_formatter))
+    ax2.set_xlabel("SST 线性趋势（°C/十年）")
+    ax2.set_ylabel("纬度")
+    ax2.set_title("ERSST v5 纬向升温趋势（1982–2024，2° 网格）", fontsize=15)
+    ax2.grid(True, ls=":", lw=0.8, alpha=0.55)
+    ax2.set_axisbelow(True)
+    arctic = summary["arctic_60n_trend_per_decade_c"]["trend_per_decade_c"]
+    tropics = summary["tropics_trend_per_decade_c"]["trend_per_decade_c"]
+    amp = summary["arctic_amplification_ratio"]
+    ax2.text(0.98, 0.96,
+             f"北极（≥60°N）{arctic:+.4f} °C/十年\n放大 {amp:.3f}×\n热带 {tropics:+.4f} °C/十年",
+             transform=ax2.transAxes, va="top", ha="right", fontsize=11,
+             bbox={"boxstyle": "round,pad=0.35", "fc": "white", "ec": "0.6", "alpha": 0.92})
+    ax2.legend(loc="lower right", fontsize=9, framealpha=0.92)
+
+    fig.text(0.01, 0.008,
+             "注：NOAA ERSST v5，2° 重建产品，1982–2024；逐年纬向平均 → cos(lat) 面积加权全球序列 → OLS，"
+             "95% CI 用 Student-t；纬向趋势为各纬度独立 OLS。线性趋势不代表非线性/空间显著性。",
+             fontsize=9, color="0.35", va="bottom")
+    if ctx["synthetic"]:
+        add_synthetic_watermark(fig)
+    path = ctx["out_dir"] / "global_warming_trend.png"
+    save_png(fig, path, dpi=200, bbox_inches=None)
+    _assert_png_size(path, (4800, 2700))
+    print(f"  ERSST 全球趋势拟合 {fit['slope_per_decade']:+.4f} °C/十年，"
+          f"CI ±{fit['ci95_per_decade']:.4f}，R²={fit['r2']:.3f}", flush=True)
+    return path
+
+
+def plot_ersst_vs_oisst(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path | None:
+    """2016–2020 OISST 0.25° 与 ERSST v5 2° 纬向一致性检查。"""
+    if not ERSST_VS_OISST_CSV.exists():
+        print("  ERSST/OISST 交叉校验数据未就绪，跳过 ersst_vs_oisst_check.png", flush=True)
+        return None
+    df = pd.read_csv(ERSST_VS_OISST_CSV)
+    lat = df["latitude"].to_numpy(float)
+    ersst = df["ersst_annual"].to_numpy(float)
+    oisst = df["oisst_all_annual"].to_numpy(float)
+    diff = df["diff_all_minus_ersst"].to_numpy(float)
+    ice_bias = df["diff_icefree_minus_ersst"].to_numpy(float)
+    ok = np.isfinite(oisst) & np.isfinite(ersst) & np.isfinite(diff)
+    if not ok.any():
+        print("  ERSST/OISST 没有共同有效纬度，跳过", flush=True)
+        return None
+    bias = float(np.mean(diff[ok]))
+    rmse = float(np.sqrt(np.mean(diff[ok] ** 2)))
+    r = float(np.corrcoef(oisst[ok], ersst[ok])[0, 1])
+    band = np.isfinite(ice_bias) & (np.abs(lat) <= 60)
+    if_bias = float(np.mean(ice_bias[band]))
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(20.0, 12.0),
+                                   gridspec_kw={"height_ratios": [1.3, 1.0]})
+    fig.subplots_adjust(left=0.075, right=0.975, bottom=0.10, top=0.92, hspace=0.36)
+    ax1.plot(oisst, lat, color="#111111", lw=1.7, label="OISST v2.1（0.25°，平均到 2°）")
+    ax1.plot(ersst, lat, color="#D35400", lw=1.4, ls="--", label="ERSST v5（2°）")
+    ax1.set_xlabel("2016–2020 年均 SST（°C）")
+    ax1.set_ylabel("纬度")
+    ax1.set_yticks(np.arange(-90, 91, 30))
+    ax1.yaxis.set_major_formatter(FuncFormatter(lat_formatter))
+    ax1.grid(True, ls=":", lw=0.8, alpha=0.55)
+    ax1.set_axisbelow(True)
+    ax1.legend(loc="lower right", fontsize=10, framealpha=0.92)
+    ax1.set_title("OISST v2.1 与 ERSST v5 纬向平均 SST（2016–2020）", fontsize=15)
+    ax1.text(0.015, 0.97,
+             f"RMSE = {rmse:.4f} °C   bias = {bias:+.4f} °C   r = {r:.6f}",
+             transform=ax1.transAxes, va="top", ha="left", fontsize=12,
+             bbox={"boxstyle": "round,pad=0.35", "fc": "white", "ec": "0.6", "alpha": 0.92})
+
+    ax2.axhspan(-60, 60, color="#8FB8D8", alpha=0.10, lw=0)
+    ax2.fill_betweenx(lat, 0, diff, where=np.isfinite(diff), color="#7F8C8D", alpha=0.22, lw=0)
+    ax2.plot(diff, lat, color="#6A3D9A", lw=1.4)
+    ax2.axvline(0, color="0.25", lw=1.0)
+    ax2.set_xlabel("OISST − ERSST（°C）")
+    ax2.set_ylabel("纬度")
+    ax2.set_yticks(np.arange(-90, 91, 30))
+    ax2.yaxis.set_major_formatter(FuncFormatter(lat_formatter))
+    ax2.grid(True, ls=":", lw=0.8, alpha=0.55)
+    ax2.set_axisbelow(True)
+    ax2.set_title("纬向差值（OISST − ERSST）", fontsize=15)
+    ax2.text(0.015, 0.97,
+             f"60°S–60°N ice-free bias = {if_bias:+.4f} °C\n"
+             f"全球 all-ocean RMSE = {rmse:.4f} °C，bias = {bias:+.4f} °C",
+             transform=ax2.transAxes, va="top", ha="left", fontsize=11,
+             bbox={"boxstyle": "round,pad=0.35", "fc": "white", "ec": "0.6", "alpha": 0.92})
+
+    fig.text(0.01, 0.008,
+             "注：这是两套独立观测产品的一致性检查，不是对错判定。OISST 0.25° 细网格先按 "
+             "[lat−1°, lat+1°) 窗口、cos(lat)·valid_count 聚合到 ERSST 2° 网格；"
+             "差值来源包括产品分辨率、偏差订正、海冰掩膜与 2016–2020 短期窗口，不能据此判定某一方错误。",
+             fontsize=9, color="0.35", va="bottom")
+    if ctx["synthetic"]:
+        add_synthetic_watermark(fig)
+    path = ctx["out_dir"] / "ersst_vs_oisst_check.png"
+    save_png(fig, path, dpi=200, bbox_inches=None)
+    _assert_png_size(path, (4000, 2400))
+    print(f"  ERSST/OISST：RMSE={rmse:.4f}, bias={bias:+.4f}, r={r:.6f}, "
+          f"60S–60N icefree bias={if_bias:+.4f}", flush=True)
+    return path
+
+
+
 def indian_regression_check() -> dict:
     if not INDIAN_CSV.exists():
         raise SystemExit(f"缺少 {INDIAN_CSV}，无法做印度洋回归自检")
@@ -1395,6 +1602,8 @@ FIGURES = {
     "anomaly": plot_map_anomaly,
     "heatmap": plot_heatmap,
     "indian": plot_indian_vs_global,
+    "warming": plot_warming_trend,
+    "ersst_check": plot_ersst_vs_oisst,
 }
 
 
@@ -1404,7 +1613,7 @@ def main() -> int:
                         help="绘图覆盖率阈值（默认 0.10）")
     parser.add_argument("--fixture", action="store_true", help="强制使用 .tmp/fixture 合成数据")
     parser.add_argument("--refresh-fixture", action="store_true", help="重新生成合成 fixture")
-    parser.add_argument("--figures", default="", help="只画指定图，逗号分隔：profile,basins,map,regions,mollweide,anomaly,heatmap,indian")
+    parser.add_argument("--figures", default="", help="只画指定图，逗号分隔：profile,basins,map,regions,mollweide,anomaly,heatmap,indian,warming,ersst_check")
     args = parser.parse_args()
 
     cov_min = float(args.coverage_min)

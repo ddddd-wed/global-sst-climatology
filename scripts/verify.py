@@ -1003,6 +1003,125 @@ def check_anomaly_grid(data_dir: Path) -> dict:
         return make_check(name, "fail", f"异常场校验失败：{exc}")
 
 
+def check_ersst_global_trend(data_dir: Path) -> dict:
+    name = "ERSST v5 全球趋势独立复算"
+    series_path = data_dir / "ersst_global_series.csv"
+    summary_path = data_dir / "ersst_summary.json"
+    if not series_path.exists() or not summary_path.exists():
+        return make_check(name, "skip", "ERSST global_series/summary 未就绪，跳过")
+    try:
+        df = pd.read_csv(series_path)
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        years = df["year"].to_numpy(dtype=float)
+        y = df["global_mean_sst"].to_numpy(dtype=float)
+        valid = np.isfinite(y)
+        x = years[valid]
+        yy = y[valid]
+        n = len(x)
+        slope, intercept = np.polyfit(x, yy, 1)
+        fit = slope * x + intercept
+        resid = yy - fit
+        se = float(np.sqrt(np.sum(resid ** 2) / (n - 2) / np.sum((x - x.mean()) ** 2)))
+        # 独立复算用正态近似 1.96；与数据侧 Student-t 2.0195 的 CI 差异 <0.002 即通过
+        ci = 1.96 * se * 10.0
+        r2 = 1.0 - float(np.sum(resid ** 2) / np.sum((yy - yy.mean()) ** 2))
+        trend = float(slope * 10.0)
+        expected = summary["global_trend_per_decade_c"]
+        metrics = {
+            "n_years": n, "trend": trend, "ci95": ci, "r2": r2,
+            "summary_trend": expected["trend_per_decade_c"],
+            "summary_ci95": expected["ci95_halfwidth_c_per_decade"],
+        }
+        issues = []
+        if abs(trend - expected["trend_per_decade_c"]) > 0.005:
+            issues.append(f"趋势 {trend:.4f} vs summary {expected['trend_per_decade_c']:.4f} >0.005")
+        if abs(ci - expected["ci95_halfwidth_c_per_decade"]) > 0.002:
+            issues.append(f"CI {ci:.4f} vs summary {expected['ci95_halfwidth_c_per_decade']:.4f} >0.002")
+        if n != expected["n_years"]:
+            issues.append(f"n_years {n} != summary {expected['n_years']}")
+        if not (0.0 <= r2 <= 1.0):
+            issues.append(f"R² {r2} 越界")
+        if not (0.0 <= expected["p_value"] <= 1.0):
+            issues.append("p_value 越界")
+        if issues:
+            return make_check(name, "fail", "；".join(issues), metrics)
+        return make_check(
+            name, "pass",
+            f"polyfit 趋势 {trend:+.4f} °C/十年 vs summary {expected['trend_per_decade_c']:+.4f}"
+            f"（Δ={abs(trend - expected['trend_per_decade_c']):.5f}）；CI {ci:.4f} vs "
+            f"{expected['ci95_halfwidth_c_per_decade']:.4f}（Δ={abs(ci - expected['ci95_halfwidth_c_per_decade']):.5f}）；"
+            f"n={n}，R²={r2:.3f}，p={expected['p_value']:.2e}",
+            metrics,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_check(name, "fail", f"ERSST 全球趋势复算失败：{exc}")
+
+
+def check_ersst_zonal_trend(data_dir: Path) -> dict:
+    name = "ERSST v5 纬向趋势与结构"
+    zonal_path = data_dir / "ersst_zonal.csv"
+    trend_path = data_dir / "ersst_trend.csv"
+    if not zonal_path.exists() or not trend_path.exists():
+        return make_check(name, "skip", "ERSST zonal/trend 未就绪，跳过")
+    try:
+        zonal = pd.read_csv(zonal_path)
+        trend = pd.read_csv(trend_path)
+        lats = np.sort(zonal["latitude"].unique())
+        issues = []
+        if len(lats) != 89:
+            issues.append(f"纬度数 {len(lats)} != 89")
+        if len(trend) != 89:
+            issues.append(f"trend 行数 {len(trend)} != 89")
+        if sorted(zonal["year"].unique()) != list(range(1982, 2025)):
+            issues.append("zonal 年份不是 1982–2024")
+        if sorted(trend["latitude"].to_numpy(dtype=float)) != sorted(lats):
+            issues.append("trend/zonal 纬度不一致")
+        finite_n = trend["n_years"].to_numpy(dtype=float)
+        positive_n = np.isfinite(finite_n) & (finite_n > 0)
+        if positive_n.any() and not np.all(finite_n[positive_n] == 43):
+            issues.append("trend n_years 存在非 43 行")
+        finite_r2 = trend["r2"].to_numpy(dtype=float)
+        finite_p = trend["p_value"].to_numpy(dtype=float)
+        ok_r2 = np.isfinite(finite_r2)
+        if ok_r2.any() and (np.any(finite_r2[ok_r2] < 0) or np.any(finite_r2[ok_r2] > 1)):
+            issues.append("r2 越界")
+        ok_p = np.isfinite(finite_p)
+        if ok_p.any() and (np.any(finite_p[ok_p] < 0) or np.any(finite_p[ok_p] > 1)):
+            issues.append("p_value 越界")
+        samples = []
+        for wanted in (60.0, 0.0, -40.0):
+            i = int(np.argmin(np.abs(lats - wanted)))
+            lat = float(lats[i])
+            sub = zonal[zonal["latitude"] == lat]
+            valid = np.isfinite(sub["sst_annual"].to_numpy(dtype=float))
+            x = sub["year"].to_numpy(dtype=float)[valid]
+            yy = sub["sst_annual"].to_numpy(dtype=float)[valid]
+            if len(x) < 3:
+                issues.append(f"{lat:+.0f}° 有效年数不足")
+                continue
+            slope = float(np.polyfit(x, yy, 1)[0] * 10.0)
+            row = trend[np.isclose(trend["latitude"], lat)]
+            if row.empty:
+                issues.append(f"{lat:+.0f}° 缺少 trend 行")
+                continue
+            expected = float(row["trend_per_decade"].iloc[0])
+            diff = abs(slope - expected)
+            samples.append({"latitude": lat, "slope": slope, "trend_csv": expected, "diff": diff})
+            if diff > 0.005:
+                issues.append(f"{lat:+.0f}° slope {slope:+.4f} vs {expected:+.4f}（Δ={diff:.4f}）")
+        metrics = {"n_lat": len(lats), "samples": samples}
+        if issues:
+            return make_check(name, "fail", "；".join(issues), metrics)
+        return make_check(
+            name, "pass",
+            f"89 纬度 × 43 年；3 个抽样纬度（60N/0/40S）复算 slope 最大差 "
+            f"{max(s['diff'] for s in samples):.5f} °C/十年 ≤ 0.005；n_years=43，r2/p 均 ∈[0,1]",
+            metrics,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_check(name, "fail", f"ERSST 纬向趋势复算失败：{exc}")
+
+
 def check_stats_columns(data_dir: Path) -> dict:
     name = "统计列健全性"
     path = data_dir / "zonal_mean_global.csv"
@@ -1228,6 +1347,8 @@ def run(data_dir: Path, raw_dir: Path, report_path: Path, skip_online: bool,
         check_icefree_recompute(raw_dir, ice_raw_dir, target_df, ocean_mask, mask_source),
         check_anomaly_grid(data_dir),
         check_stats_columns(data_dir),
+        check_ersst_global_trend(data_dir),
+        check_ersst_zonal_trend(data_dir),
         check_online(raw_dir, skip_online),
         check_indian_regression(INDIAN_CSV),
     ]
