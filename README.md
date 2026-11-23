@@ -37,12 +37,12 @@
 ├── requirements.txt              # numpy / pandas / matplotlib（无新增依赖）
 ├── README.md
 ├── data/
-│   ├── raw/                      # 60 个 sst_YYYY_MM.csv.gz + manifest.json（不入库，可一键重下）
+│   ├── raw_global/               # 60 个 sst_YYYY_MM.csv.gz（全球，约 252 MB，不入库）
 │   ├── zonal_mean_global.csv     # 720 行全球纬向平均（数据侧产出，入库）
 │   ├── zonal_mean_basins.csv     # global + 五大洋纵向堆叠（数据侧产出，入库）
-│   ├── climatology_grid.npz      # 720×1440 月气候态网格（数据侧产出，入库）
-│   ├── basin_mask.npz            # 可选：lat/lon/basin_names/basin_mask(uint8)/basin_id(int8)
-│   ├── summary_metrics.json      # 可选：basins.<name>.mean_sst_cos_weighted 等汇总
+│   ├── climatology_grid.npz      # 720×1440 网格产物（数据侧产出，入库）
+│   ├── basin_mask.npz            # 海盆掩膜：basin_mask(uint8)/basin_id(int8)
+│   ├── summary_metrics.json      # 数据侧汇总：basins.<name>.mean_sst_cos_weighted 等
 │   ├── zonal_mean.csv            # 旧印度洋结果（281 行，回归基准，入库）
 │   └── verify_report.json        # verify.py 生成的复核报告（不入库）
 ├── figures/
@@ -58,7 +58,7 @@
 │   ├── config.py                 # 数据侧维护：路径、全球范围、时间、阈值
 │   ├── fetch_data.py             # 数据侧维护：按月下载 / 校验 / gzip 缓存
 │   ├── compute.py                # 数据侧维护：raw → zonal_mean_global/basins + npz
-│   ├── run_all.py                # 数据侧维护：一键下载 → 计算 → 绘图 → 验收
+│   ├── run_all.py                # 本分支：全球版一键 下载→计算→绘图→独立复核→验收
 │   ├── plot.py                   # 本分支：全球版绘图（真实数据缺失时自动用 fixture）
 │   ├── verify.py                 # 本分支：独立复核（不 import compute.py）
 │   └── make_fixture.py           # 本分支：生成合成 fixture（只写 .tmp/）
@@ -66,8 +66,8 @@
     └── test_verify.py            # 复核逻辑单元测试（unittest，无新增依赖）
 ```
 
-> 协作边界：`config.py` / `fetch_data.py` / `compute.py` / `run_all.py` 与 `data/` 下的真实数据由**数据侧**维护；
-> 本分支只改 `plot.py`、新增 `verify.py` / `make_fixture.py` / `tests/`，以及 README 中与数字无关的方法/结构。
+> 协作边界：`config.py` / `fetch_data.py` / `compute.py` 与 `data/` 下的真实数据由**数据侧**维护；
+> `plot.py` / `verify.py` / `make_fixture.py` / `run_all.py` / `tests/` 为本分支维护。
 
 ## 3. 数据契约
 
@@ -109,7 +109,7 @@
 6. **季节反相**：北半球 1 月冷、7 月暖，南半球相反；`verify.py` 用 20°–60° 纬度带的 cosφ 加权均值
    检查这一符号关系。
 7. **体积处理**：60 个时次未压缩约 2.75 GB，因此原始响应以 **gzip 无损压缩**保存为
-   `data/raw/sst_YYYY_MM.csv.gz`（落盘约 250 MB），解压后与 ERDDAP 返回逐字节一致；
+   `data/raw_global/sst_YYYY_MM.csv.gz`（落盘约 250 MB），解压后与 ERDDAP 返回逐字节一致；
    计算时直接读取 gz，数据本身未裁剪或降采样。
 
 两个比例的定义与用途对照：
@@ -125,16 +125,36 @@
 **不新增任何依赖**。
 
 ```powershell
-# 数据侧：下载 → 计算 → 绘图 → 验收（需要联网，约 2.75 GB 解压数据）
-.venv\Scripts\python.exe scripts\fetch_data.py
-.venv\Scripts\python.exe scripts\compute.py
-.venv\Scripts\python.exe scripts\plot.py
+# 一键全流程：下载(global) → 计算 → 绘图 → 独立复核 → 验收
+.venv\Scripts\python.exe scripts\run_all.py
 
-# 分析侧独立复核（不 import compute.py；raw 未入库时用 --raw-dir 指向缓存）
-.venv\Scripts\python.exe scripts\verify.py
-.venv\Scripts\python.exe scripts\verify.py --raw-dir <raw_global 目录> --report .tmp\verify_report_final.json
-.venv\Scripts\python.exe scripts\verify.py --skip-online   # 不联网
+# 已有 data/raw_global 的 60 个缓存时次，跳过下载
+.venv\Scripts\python.exe scripts\run_all.py --skip-download
+
+# 强制重下 / 调整并发 / 自定义 raw 缓存目录
+.venv\Scripts\python.exe scripts\run_all.py --force-download --jobs 8
+.venv\Scripts\python.exe scripts\run_all.py --raw-dir <raw_global 目录> --skip-download
 ```
+
+- `run_all.py` 任一步非零立即停止；最后验收：`zonal_mean_global.csv` 720×32（前 7 列契约）、
+  `zonal_mean_basins.csv` 6 个海盆、`climatology_grid.npz` 720×1440（约 5 MB）、5 张正式图
+  PNG 合法且 >100 KB、`summary_metrics.json` 含 `basins.global.mean_sst_cos_weighted`、
+  `verify.py` **6 项全 PASS**，并打印旧印度洋回归三项数值。
+- **耗时**（本机实测，raw 已缓存）：下载校验 **2.6 s**、计算 **15.1 s**、绘图 **3.4 s**、
+  复核 **20.8 s**、总计 **41.9 s**。冷启动联网下载参考约 **139 s**（数据侧实测），
+  计算约 **13 s**、复核约 **21 s**；绘图在数据侧参考约 **1–2 min**，本机实测 **3.4 s**
+  （首次字体缓存/较慢机器会更久）。
+- **缓存目录**：全球 raw 在 `data/raw_global/`（60 个 `sst_YYYY_MM.csv.gz`，约 252 MB），
+  已由 `.gitignore` 忽略、不入库；旧的印度洋缓存是 `data/raw/`，勿混用。
+  `--raw-dir` 只影响 compute/verify；`fetch_data.py` 只写默认缓存，自定义目录时请配 `--skip-download`。
+- 分部执行（便于调试）：
+  ```powershell
+  .venv\Scripts\python.exe scripts\fetch_data.py --region global
+  .venv\Scripts\python.exe scripts\compute.py --region global --raw-dir data\raw_global
+  .venv\Scripts\python.exe scripts\plot.py
+  .venv\Scripts\python.exe scripts\verify.py --raw-dir data\raw_global --report .tmp\verify_report_final.json
+  .venv\Scripts\python.exe scripts\verify.py --skip-online   # 不联网
+  ```
 
 - **绘图自动降级**：`plot.py` 启动时检查 `zonal_mean_global.csv` / `zonal_mean_basins.csv` /
   `climatology_grid.npz`。三者任一缺失就打印「真实数据未就绪，使用 fixture」，自动在 `.tmp/fixture/`
@@ -181,7 +201,7 @@
 
 `verify.py` **不 import `compute.py` 的任何函数**，从零实现口径，逐项给出 `pass/fail/skip`：
 
-1. **数值复算**：读取 `data/raw/`（或 `--raw-dir`）的 60 个 `csv.gz`，独立重算「逐时次纬向平均 →
+1. **数值复算**：读取 `data/raw_global/`（或 `--raw-dir`）的 60 个 `csv.gz`，独立重算「逐时次纬向平均 →
    同月多年平均 → 12 月等权年均」，抽 **8 个纬度（-70/-45/-20/0/20/40/60/75°）× 1 月、7 月** 与
    `zonal_mean_basins.csv` 的 `global` 行按纬度对齐，容差 **0.01 °C**；年均同纬度一并比对。
    统计域用 `basin_mask.npz::basin_mask`（或 `basin_id`）剔除**里海（719 格）、北美五大湖（531 格）、
@@ -275,7 +295,7 @@ fixture 自测仍保留：`verify.py --data-dir .tmp/fixture --skip-online` →
 
 ## 10. 数据与图件是否入库
 
-- **`data/raw/` 不入库**：60 个 gzip CSV 约 250 MB，`fetch_data.py` 可一键重新下载；
+- **`data/raw_global/` 不入库**：60 个 gzip CSV 约 252 MB，`fetch_data.py --region global` 可一键重新下载；
   `manifest.json` 记录每个文件的原始/压缩字节数与请求信息。
 - **`data/zonal_mean_global.csv` / `zonal_mean_basins.csv` / `climatology_grid.npz` 入库**（数据侧产出），
   是全部全球结论的数值基础。
