@@ -42,6 +42,8 @@ from map_labels import CURRENT_LABELS, OCEAN_LABELS, SEA_LABELS_T2, SEA_LABELS_T
 DEFAULT_GRID = ROOT / "data" / "climatology_grid.npz"
 DEFAULT_MASK = ROOT / "data" / "basin_mask.npz"
 DEFAULT_ZONAL = ROOT / "data" / "zonal_mean_global.csv"
+DEFAULT_ANOM = ROOT / "data" / "anomaly_grid.npz"
+DEFAULT_REF = ROOT / "data" / "zonal_ref.csv"
 DEFAULT_OUT = ROOT / "figures" / "global_sst_map.html"
 VMIN, VMAX = -2.0, 32.0
 DIFF_LIMIT = 12.0
@@ -108,9 +110,48 @@ def _delta_u16(arr: np.ndarray) -> np.ndarray:
     return ((q - prev) & 0xFFFF).astype("<u2")
 
 
-def b64_int16(arr: np.ndarray) -> str:
-    raw = gzip.compress(_delta_u16(arr).tobytes(order="C"), compresslevel=9, mtime=0)
-    return base64.b64encode(raw).decode("ascii")
+def _quantize(arr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    q = np.full(arr.shape, -32768, dtype=np.int16)
+    valid = mask & np.isfinite(arr)
+    q[valid] = np.clip(np.rint(arr[valid] * 100.0), -32767, 32767).astype(np.int16)
+    return q
+
+
+def load_ref(ref_path: Path, zonal_path: Path, lat: np.ndarray) -> np.ndarray:
+    if ref_path.exists():
+        df = pd.read_csv(ref_path)
+        rlat = df["latitude"].to_numpy(dtype=float)
+        vals = df["ref_annual"].to_numpy(dtype=float)
+    else:
+        df = pd.read_csv(zonal_path)
+        rlat = df["latitude"].to_numpy(dtype=float)
+        vals = df["sst_annual"].to_numpy(dtype=float)
+    if len(rlat) != len(lat) or not np.allclose(rlat, lat, atol=1e-6):
+        vals = np.interp(lat, rlat, vals)
+    return vals
+
+
+def load_anomaly(
+    anom_path: Path, ref: np.ndarray, annual: np.ndarray, mask: np.ndarray
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    if not anom_path.exists():
+        return None, None
+    with np.load(anom_path) as npz:
+        if "sst_annual_anom" not in npz.files:
+            raise SystemExit(f"{anom_path} 缺少 sst_annual_anom")
+        anom = npz["sst_annual_anom"].astype(np.float32)
+    if anom.shape != annual.shape:
+        raise SystemExit(f"anomaly_grid 形状 {anom.shape} != {annual.shape}")
+    expected = annual - ref[:, None]
+    ok = np.isfinite(expected) & np.isfinite(anom)
+    max_diff = float(np.max(np.abs(expected[ok] - anom[ok]))) if ok.any() else float("nan")
+    if not np.isfinite(max_diff) or max_diff > 0.01:
+        raise SystemExit(f"anomaly_grid 与 zonal_ref 不一致：maxdiff={max_diff:.4f} °C > 0.01")
+    print(f"  权威异常场校验通过：{anom_path.name} vs ref，最大差 {max_diff:.4f} °C")
+    return _quantize(anom, mask), anom
+
+
+
 
 
 def _undelta_u16(raw: bytes, shape: tuple[int, int]) -> np.ndarray:
@@ -122,6 +163,11 @@ def _undelta_u16(raw: bytes, shape: tuple[int, int]) -> np.ndarray:
         q[:, j] = np.where(v >= 0x8000, v - 0x10000, v).astype(np.int16)
         prev = v
     return q
+
+
+def b64_int16(arr: np.ndarray) -> str:
+    raw = gzip.compress(_delta_u16(arr).tobytes(order="C"), compresslevel=9, mtime=0)
+    return base64.b64encode(raw).decode("ascii")
 
 
 def b64_u8_gzip(arr: np.ndarray) -> str:
@@ -161,8 +207,10 @@ def make_html(
     basin: np.ndarray,
     contours: dict[str, list[list[list[float]]]],
     ref: np.ndarray,
+    anomaly_q: np.ndarray | None = None,
 ) -> str:
     h, w = quantized["annual"].shape
+    anomaly_b64 = "" if anomaly_q is None else b64_int16(anomaly_q)
     cmap = colormaps["RdYlBu_r"]
     cmap_diff = colormaps["RdBu_r"]
     lut = (cmap(np.linspace(0.0, 1.0, 256))[:, :3] * 255.0).round().astype(np.uint8)
@@ -279,6 +327,7 @@ const META = __META__;
 const ANNUAL_B64 = "__ANNUAL__";
 const JAN_B64 = "__JAN__";
 const JUL_B64 = "__JUL__";
+const ANOM_B64 = "__ANOM__";
 const BASIN_B64 = "__BASIN__";
 const LUT_B64 = "__LUT__";
 const LUT_DIFF_B64 = "__LUT_DIFF__";
@@ -317,7 +366,7 @@ async function loadI16(b64) {
   return bytesToI16(await gunzipB64(b64));
 }
 
-const DATA = { annual: null, jan: null, jul: null };
+const DATA = { annual: null, jan: null, jul: null, anomaly: null };
 let BASIN = null;
 let ready = false;
 const LUT = b64ToU8(LUT_B64);
@@ -354,6 +403,10 @@ function valueAt(idx) {
     return (b - a) / 100;
   }
   if (layer === "anomaly") {
+    if (DATA.anomaly) {
+      const q = DATA.anomaly[idx];
+      return q === -32768 ? NaN : q / 100;
+    }
     const q = DATA.annual[idx];
     if (q === -32768) return NaN;
     const r = REF[Math.floor(idx / META.w)];
@@ -627,7 +680,14 @@ function updateInspect(m) {
   let diff = "—";
   if (!Number.isNaN(j) && !Number.isNaN(u)) diff = `${(u - j).toFixed(2)} °C`;
   const ref = REF[Math.floor(idx / META.w)];
-  const anom = (!Number.isNaN(a) && Number.isFinite(ref)) ? `${(a - ref).toFixed(2)} °C` : "—";
+  let anomVal = NaN;
+  if (DATA.anomaly) {
+    const qa = DATA.anomaly[idx];
+    if (qa !== -32768) anomVal = qa / 100;
+  } else if (!Number.isNaN(a) && Number.isFinite(ref)) {
+    anomVal = a - ref;
+  }
+  const anom = Number.isFinite(anomVal) ? `${anomVal.toFixed(2)} °C` : "—";
   document.getElementById('ins-basin').textContent = `海盆 ${basinName(idx)}`;
   document.getElementById('ins-sst').textContent =
     `年均 ${fmtVal(a)} · 1 月 ${fmtVal(j)} · 7 月 ${fmtVal(u)} · 温差 ${diff} · 异常 ${anom}`;
@@ -802,6 +862,7 @@ async function init() {
     ]);
     DATA.annual = a; DATA.jan = j; DATA.jul = u;
     BASIN = b;
+    if (ANOM_B64) DATA.anomaly = await loadI16(ANOM_B64);
     ready = true;
     loadingEl.style.display = "none";
     restoreViewFromHash();
@@ -825,6 +886,7 @@ init();
         .replace("__ANNUAL__", b64_int16(quantized["annual"]))
         .replace("__JAN__", b64_int16(quantized["jan"]))
         .replace("__JUL__", b64_int16(quantized["jul"]))
+        .replace("__ANOM__", anomaly_b64)
         .replace("__BASIN__", b64_u8_gzip(basin))
         .replace("__LUT__", base64.b64encode(lut.tobytes(order="C")).decode("ascii"))
         .replace("__LUT_DIFF__", base64.b64encode(lut_diff.tobytes(order="C")).decode("ascii"))
@@ -844,9 +906,16 @@ def _decode_embedded(html: str, token: str, shape: tuple[int, int]) -> np.ndarra
 
 
 def validate(html: str, originals: dict[str, np.ndarray], basin: np.ndarray,
-             lat: np.ndarray, lon: np.ndarray) -> float:
+             lat: np.ndarray, lon: np.ndarray, anomaly: np.ndarray | None = None) -> float:
     shape = originals["annual"].shape
     embedded = {key: _decode_embedded(html, f"{key.upper()}_B64", shape) for key in ("annual", "jan", "jul")}
+    if anomaly is not None:
+        embedded_anom = _decode_embedded(html, "ANOM_B64", shape)
+        ok = np.isfinite(anomaly) & np.isfinite(embedded_anom)
+        max_anom = float(np.max(np.abs(anomaly[ok] - embedded_anom[ok]))) if ok.any() else float("nan")
+        print(f"  权威异常层内嵌自检：maxdiff={max_anom:.4f} °C")
+        if not np.isfinite(max_anom) or max_anom > 0.01:
+            raise SystemExit(f"权威异常层内嵌误差 {max_anom:.4f} °C > 0.01")
     rng = np.random.default_rng(2024)
     ocean = np.flatnonzero(
         np.isfinite(originals["annual"]) & np.isfinite(originals["jan"]) & np.isfinite(originals["jul"])
@@ -887,21 +956,20 @@ def main() -> int:
     parser.add_argument("--grid", type=Path, default=DEFAULT_GRID)
     parser.add_argument("--mask", type=Path, default=DEFAULT_MASK)
     parser.add_argument("--zonal", type=Path, default=DEFAULT_ZONAL)
+    parser.add_argument("--anomaly", type=Path, default=DEFAULT_ANOM)
+    parser.add_argument("--ref", type=Path, default=DEFAULT_REF)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     args = parser.parse_args()
 
     lat, lon, quantized, mask, basin, originals = load_layers(args.grid, args.mask)
-    ref_df = pd.read_csv(args.zonal)
-    ref_lat = ref_df["latitude"].to_numpy(dtype=float)
-    ref = ref_df["sst_annual"].to_numpy(dtype=float)
-    if len(ref_lat) != len(lat) or not np.allclose(ref_lat, lat, atol=1e-6):
-        ref = np.interp(lat, ref_lat, ref)
+    ref = load_ref(args.ref, args.zonal, lat)
+    anomaly_q, anomaly = load_anomaly(args.anomaly, ref, originals["annual"], mask)
     print(f"读取 {args.grid}：{quantized['annual'].shape[1]}×{quantized['annual'].shape[0]} 网格，"
           f"海洋格点 {int(mask.sum())}")
     contours = {key: build_contours(lon, lat, q) for key, q in quantized.items()}
     print("25 °C 等值线：" + "，".join(f"{key}={len(seg)} 段" for key, seg in contours.items()))
-    html = make_html(lat, lon, quantized, basin, contours, ref)
-    worst = validate(html, originals, basin, lat, lon)
+    html = make_html(lat, lon, quantized, basin, contours, ref, anomaly_q)
+    worst = validate(html, originals, basin, lat, lon, anomaly)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(html, encoding="utf-8")

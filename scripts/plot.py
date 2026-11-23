@@ -373,6 +373,8 @@ def resolve_inputs(force_fixture: bool, refresh_fixture: bool) -> dict:
             "grid_npz": FIXTURE_DIR / "climatology_grid.npz",
             "mask_npz": FIXTURE_DIR / "basin_mask.npz",
             "summary_json": FIXTURE_DIR / "summary_metrics.json",
+            "anomaly_npz": FIXTURE_DIR / "anomaly_grid.npz",
+            "zonal_ref_csv": FIXTURE_DIR / "zonal_ref.csv",
             "out_dir": DEV_FIG_DIR,
             "synthetic": True,
         }
@@ -385,6 +387,8 @@ def resolve_inputs(force_fixture: bool, refresh_fixture: bool) -> dict:
         "grid_npz": GRID_NPZ,
         "mask_npz": MASK_NPZ,
         "summary_json": SUMMARY_JSON,
+        "anomaly_npz": ROOT / "data" / "anomaly_grid.npz",
+        "zonal_ref_csv": ROOT / "data" / "zonal_ref.csv",
         "out_dir": FIG_DIR,
         "synthetic": False,
     }
@@ -407,6 +411,48 @@ def finalize(
 # --------------------------------------------------------------------------- #
 # 图 1：全球纬向平均廓线 + 覆盖率面板
 # --------------------------------------------------------------------------- #
+PROFILE_OPTIONAL_COLUMNS = [
+    "valid_count_icefree", "coverage_icefree",
+    "sst_annual_icefree", "sst_jan_icefree", "sst_jul_icefree", "ice_frac",
+    "sst_std", "sst_p10", "sst_p90", "sst_jan_p10", "sst_jan_p90",
+    "sst_jul_p10", "sst_jul_p90", "sst_interannual_std",
+    "sst_jan_interannual_std", "sst_jul_interannual_std",
+    "interannual_min", "interannual_max",
+    "sst_warmest", "warmest_month", "sst_coldest", "coldest_month", "seasonal_amp",
+]
+
+
+def _optional_masked(df: pd.DataFrame, col: str, lat: np.ndarray, base: np.ndarray) -> np.ndarray | None:
+    if col not in df:
+        return None
+    values = df[col].to_numpy(dtype=float)
+    return np.where(base & np.isfinite(values), values, np.nan)
+
+
+def _shade_ice_bands(ax: plt.Axes, lat: np.ndarray, ice_frac: np.ndarray, threshold: float = 0.15) -> bool:
+    """把 ice_frac 高的连续纬度画成浅蓝斜纹带；返回是否画了至少一段。"""
+    high = np.isfinite(ice_frac) & (ice_frac >= threshold)
+    if not high.any():
+        return False
+    drawn = False
+    start = None
+    for i, flag in enumerate(high):
+        if flag and start is None:
+            start = i
+        if start is not None and (not flag or i == len(high) - 1):
+            end = i if not flag else i + 1
+            y0 = float(lat[start] - 0.125)
+            y1 = float(lat[end - 1] + 0.125)
+            ax.axhspan(
+                y0, y1, facecolor="#B7D9EE", edgecolor="#5B9BC4",
+                hatch="///", alpha=0.22, lw=0.0, zorder=0.5,
+                label="海冰覆盖（ice_frac ≥ 15%）" if not drawn else None,
+            )
+            drawn = True
+            start = None
+    return drawn
+
+
 def plot_global_profile(ctx: dict, cov_min: float) -> Path:
     df = pd.read_csv(ctx["global_csv"])
     lat = df["latitude"].to_numpy(dtype=float)
@@ -414,6 +460,16 @@ def plot_global_profile(ctx: dict, cov_min: float) -> Path:
     ocean_frac = zonal_ocean_fraction(df)
     annual = df["sst_annual"].to_numpy(dtype=float)
     usable = np.isfinite(annual) & np.isfinite(ocean_frac) & (ocean_frac >= cov_min)
+    base = np.isfinite(ocean_frac) & (ocean_frac >= cov_min)
+    missing = [c for c in PROFILE_OPTIONAL_COLUMNS if c not in df]
+    optional_ready = len(missing) < len(PROFILE_OPTIONAL_COLUMNS)
+    if missing:
+        print(
+            f"  数据侧列未就绪，已跳过 {len(missing)} 列：{', '.join(missing[:6])}"
+            + (" …" if len(missing) > 6 else ""),
+            flush=True,
+        )
+
 
     fig = plt.figure(figsize=(12.0, 7.6))
     gs = fig.add_gridspec(1, 2, width_ratios=[4.4, 1.05], wspace=0.06)
@@ -439,6 +495,54 @@ def plot_global_profile(ctx: dict, cov_min: float) -> Path:
         ax.plot(masked, lat, color=color, lw=lw, ls=ls, label=label, zorder=zorder)
 
     stacked = np.concatenate(valid_values) if valid_values else np.array([])
+
+    # 无冰口径：与含冰主曲线并列，不静默替换
+    icefree_series = [
+        ("sst_annual_icefree", "无冰年均", "#111111", 1.25, "--"),
+        ("sst_jan_icefree", "无冰 1 月", "#2E6DB4", 1.0, "--"),
+        ("sst_jul_icefree", "无冰 7 月", "#C0392B", 1.0, "--"),
+    ]
+    for col, label, color, lw, ls in icefree_series:
+        values = _optional_masked(df, col, lat, base)
+        if values is None:
+            continue
+        valid_values.append(values)
+        ax.plot(values, lat, color=color, lw=lw, ls=ls, alpha=0.9, label=label, zorder=2.5)
+
+    # 空间离散（P10–P90）与 5 年年际波动（±1σ）是两种不同概念
+    p10 = _optional_masked(df, "sst_p10", lat, base)
+    p90 = _optional_masked(df, "sst_p90", lat, base)
+    if p10 is not None and p90 is not None:
+        ax.fill_betweenx(
+            lat, p10, p90, where=np.isfinite(p10) & np.isfinite(p90),
+            color="#7F8C8D", alpha=0.20, lw=0, label="空间 P10–P90", zorder=1.2,
+        )
+        valid_values.extend([p10, p90])
+    istd = _optional_masked(df, "sst_interannual_std", lat, base)
+    if istd is not None:
+        lo = annual - istd
+        hi = annual + istd
+        ax.fill_betweenx(
+            lat, lo, hi, where=base & np.isfinite(lo) & np.isfinite(hi),
+            color="#E8A33D", alpha=0.18, lw=0, label="5 年年际 ±1σ", zorder=1.1,
+        )
+        valid_values.extend([lo, hi])
+
+    # 真实最暖月 / 最冷月包络（不是 1 月/7 月）
+    for col, label, color, ls in (
+        ("sst_warmest", "真实最暖月", "#D35400", "-."),
+        ("sst_coldest", "真实最冷月", "#2471A3", "-."),
+    ):
+        values = _optional_masked(df, col, lat, base)
+        if values is None:
+            continue
+        valid_values.append(values)
+        ax.plot(values, lat, color=color, lw=0.9, ls=ls, alpha=0.65, label=label, zorder=2.2)
+
+    ice_frac = _optional_masked(df, "ice_frac", lat, base)
+    ice_drawn = _shade_ice_bands(ax, lat, ice_frac) if ice_frac is not None else False
+    stacked = np.concatenate(valid_values) if valid_values else np.array([])
+
     if not np.isfinite(stacked).any():
         raise SystemExit("zonal_mean_global.csv 缺少可绘制的 SST 列")
     ax.set_xlim(np.floor(np.nanmin(stacked)) - 0.8, np.ceil(np.nanmax(stacked)) + 1.4)
@@ -482,7 +586,7 @@ def plot_global_profile(ctx: dict, cov_min: float) -> Path:
             zorder=6,
         )
 
-    ax.legend(loc="lower right", framealpha=0.92, fontsize=10)
+    ax.legend(loc="lower right", framealpha=0.92, fontsize=8.2, ncol=2)
     subtitle = "合成数据（fixture）" if ctx["synthetic"] else "2016–2020 气候态，0.25° 原生格点"
     ax.set_title(f"全球纬向平均海表温度随纬度变化\n（{subtitle}，90°S–90°N）", fontsize=13)
 
@@ -502,17 +606,29 @@ def plot_global_profile(ctx: dict, cov_min: float) -> Path:
     axc.text(cov_min * 100 + 1.5, LAT_MIN + 2.5, f"{cov_min:.0%} 门槛", fontsize=7.5,
              color="#8E2F2F", rotation=90, va="bottom")
 
-    fig.text(
-        0.01,
-        0.005,
+    note = (
         "注：纬向平均为同一纬度圈内有效海洋格点（非陆地/海冰）的算术平均，未乘 cosφ；\n"
         f"海洋占比 zonal_ocean_frac = 有效格点数 / {N_LON_GLOBAL}，曲线只画 ≥ {cov_min:.0%} 的纬度；"
         "有数据比例 coverage = 有效格点数 / ocean_grid_count（非海冰/非缺测），仅用于副图展示。\n"
         "里海 719 + 北美五大湖 531 + 拉多加湖 52 = 1302 个内陆水体格点按 basin_mask=0 剔除；"
-        "45–50°N 的海洋占比因此偏低。",
+        "45–50°N 的海洋占比因此偏低。"
+    )
+    if optional_ready:
+        note += (
+            "\n新列口径：实线=含冰/原口径，虚线=无冰（sst_*_icefree），两者并列、不静默替换；"
+            "灰带=空间 P10–P90，橙带=5 年年际 ±1σ（两者不是同一概念）；"
+            "橙/蓝点划线=真实最暖月/最冷月，不是 1 月/7 月"
+            + ("；浅蓝斜纹=海冰覆盖（ice_frac ≥ 15%）" if ice_drawn else "")
+            + "。"
+        )
+    fig.text(
+        0.01,
+        0.005,
+        note,
         fontsize=8.3,
         color="0.35",
         va="bottom",
+        wrap=True,
     )
     return finalize(fig, ctx, "global_sst_vs_latitude.png")
 
@@ -970,15 +1086,49 @@ def plot_map_mollweide(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Pat
     return path
 
 
-def plot_map_anomaly(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
-    """相对同纬度海洋平均的 SST 异常（不是相对时间平均）。"""
-    lat, lon, annual, _mask = _load_map_data(ctx)
+def _load_anomaly_field(
+    ctx: dict, lat: np.ndarray, lon: np.ndarray, annual: np.ndarray
+) -> tuple[np.ndarray, str]:
+    """优先用数据侧 anomaly_grid.npz，并与 zonal_ref.csv 交叉校验；否则本地算。"""
+    anom_path = ctx.get("anomaly_npz", ROOT / "data" / "anomaly_grid.npz")
+    ref_path = ctx.get("zonal_ref_csv", ROOT / "data" / "zonal_ref.csv")
+    if anom_path.exists():
+        with np.load(anom_path) as npz:
+            if "sst_annual_anom" not in npz.files:
+                raise RuntimeError(f"{anom_path} 缺少 sst_annual_anom")
+            anom = npz["sst_annual_anom"].astype(float)
+        if anom.shape != annual.shape:
+            raise RuntimeError(f"anomaly_grid 形状 {anom.shape} != {annual.shape}")
+        if ref_path.exists():
+            ref_df = pd.read_csv(ref_path)
+            ref_lat = ref_df["latitude"].to_numpy(dtype=float)
+            ref = ref_df["ref_annual"].to_numpy(dtype=float)
+            if len(ref_lat) != len(lat) or not np.allclose(ref_lat, lat, atol=1e-6):
+                ref = np.interp(lat, ref_lat, ref)
+            expected = annual - ref[:, None]
+            ok = np.isfinite(expected) & np.isfinite(anom)
+            max_diff = float(np.max(np.abs(expected[ok] - anom[ok]))) if ok.any() else float("nan")
+            if not np.isfinite(max_diff) or max_diff > 0.01:
+                raise RuntimeError(
+                    f"anomaly_grid 与 zonal_ref 不一致：max|anom-(sst-ref)|={max_diff:.4f} °C > 0.01"
+                )
+            print(f"  异常场交叉校验通过：{anom_path.name} vs {ref_path.name}，最大差 {max_diff:.4f} °C", flush=True)
+        print(f"  使用数据侧权威异常场：{anom_path}", flush=True)
+        return anom, "anomaly_grid.npz"
+
+    print("  数据侧异常场未就绪，使用本地 sst_annual − 同纬度平均算法。", flush=True)
     ref_df = pd.read_csv(ctx["global_csv"])
     ref_lat = ref_df["latitude"].to_numpy(dtype=float)
     ref = ref_df["sst_annual"].to_numpy(dtype=float)
     if len(ref_lat) != len(lat) or not np.allclose(ref_lat, lat, atol=1e-6):
         ref = np.interp(lat, ref_lat, ref)
-    anomaly = annual - ref[:, None]
+    return annual - ref[:, None], "local"
+
+
+def plot_map_anomaly(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
+    """相对同纬度海洋平均的 SST 异常（不是相对时间平均）。"""
+    lat, lon, annual, _mask = _load_map_data(ctx)
+    anomaly, source = _load_anomaly_field(ctx, lat, lon, annual)
     anomaly = np.clip(anomaly, -8.0, 8.0)
     cmap = matplotlib.colormaps["RdBu_r"].copy()
     cmap.set_bad("#E6E6E6")
@@ -1019,11 +1169,12 @@ def plot_map_anomaly(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
         fontsize=13,
     )
     ax.set_facecolor("#E6E6E6")
+    source_note = "数据侧权威 anomaly_grid.npz" if source == "anomaly_grid.npz" else "本地 sst_annual − 同纬度平均"
     fig.text(
         0.01,
         0.005,
         "注：异常 = 该格点年均 SST − 同纬度有效海洋格点的算术平均，**不是相对时间平均**；"
-        "色标对称 ±8 °C，超出部分截断；0.25°≈28 km 为数据分辨率上限。",
+        f"来源：{source_note}；色标对称 ±8 °C，超出部分截断；0.25°≈28 km 为数据分辨率上限。",
         fontsize=8.4, color="0.35", va="bottom",
     )
     if ctx["synthetic"]:

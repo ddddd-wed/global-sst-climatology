@@ -49,6 +49,8 @@
 │   ├── climatology_grid.npz      # 720×1440 网格产物（数据侧产出，入库）
 │   ├── basin_mask.npz            # 海盆掩膜：basin_mask(uint8)/basin_id(int8)
 │   ├── summary_metrics.json      # 数据侧汇总：basins.<name>.mean_sst_cos_weighted 等
+│   ├── anomaly_grid.npz          # 可选：数据侧权威 sst_*_anom/icefree/anomaly 场
+│   ├── zonal_ref.csv             # 可选：latitude, ref_annual/ref_jan/ref_jul
 │   ├── zonal_mean.csv            # 旧印度洋结果（281 行，回归基准，入库）
 │   └── verify_report.json        # verify.py 生成的复核报告（不入库）
 ├── figures/
@@ -152,14 +154,23 @@
   `zonal_mean_basins.csv` 6 个海盆、`climatology_grid.npz` 720×1440（约 5 MB）、8 张正式图
   PNG 合法且 >100 KB、`summary_metrics.json` 含 `basins.global.mean_sst_cos_weighted`、
   `verify.py` **6 项无失败**（在线抽样网络不可用时可 SKIP），并打印旧印度洋回归三项数值。
-- **耗时**（本机实测，raw 已缓存）：下载校验 **2.9 s**、计算 **16.7 s**、绘图 **8.2 s**、
-  复核 **47.3 s**、总计 **77.1 s**（本机 77.9 s 墙钟）。冷启动联网下载参考约 **139 s**（数据侧实测），
-  计算约 **13 s**、复核约 **21 s**；绘图在数据侧参考约 **1–2 min**，本机实测 8.2 s
+- **耗时**（本机实测，raw 已缓存）：下载校验 **2.6 s**、计算 **15.9 s**、绘图 **8.1 s**、
+  复核 **22.8 s**、总计 **51.3 s**（本机 51.9 s 墙钟）。冷启动联网下载参考约 **139 s**（数据侧实测），
+  计算约 **13 s**、复核约 **21 s**；绘图在数据侧参考约 **1–2 min**，本机实测 8.1 s
   （含 4K 地图、Mollweide、异常图、6 宫格放大图、中文标注与 HTML；首次字体缓存/较慢机器会更久）。
 - **交互地图**：`scripts/make_map_viewer.py` 读取 `climatology_grid.npz` / `basin_mask.npz`，
   把 `sst_annual` / `sst_jan` / `sst_jul` 转成 int16×100 差分 + gzip + base64 内嵌到
   `figures/global_sst_map.html`（约 2.10 MB），五个图层（年均/1月/7月/7月−1月/同纬度异常）实时切换，
   浏览器本地 canvas 重绘；滚轮缩放/拖动/双击放大/重置、Shift 框选统计、URL hash 深链，无需网络。
+- **T5/T6 新列消费（自动降级）**：`plot.py` 检测
+  `sst_*_icefree`（无冰）、`sst_p10/p90`（空间离散）、`sst_interannual_std`（5 年年际）、
+  `sst_warmest/coldest`（真实最暖/最冷月）、`ice_frac`（海冰斜纹）等列；
+  缺列时打印「数据侧列未就绪，已跳过 X」并保持旧图，不报错。若 `data/anomaly_grid.npz`
+  存在则优先使用并与 `data/zonal_ref.csv` 交叉校验（容差 0.01 °C），否则用本地
+  `sst_annual − 同纬度平均`；HTML 第五层同样优先使用权威异常场。
+- **T5/T6 自测**：用 fixture 伪造全部 23 个新列跑通全球廓线；真实数据缺列时只打印
+  「已跳过 23 列」并正常出 8 张图；伪造 `anomaly_grid.npz` 与 `zonal_ref.csv` 时
+  权威异常场校验通过，HTML 增加到 2.61 MB（仍 <3 MB）。
 - **缓存目录**：全球 raw 在 `data/raw_global/`（60 个 `sst_YYYY_MM.csv.gz`，约 252 MB），
   已由 `.gitignore` 忽略、不入库；旧的印度洋缓存是 `data/raw/`，只服务印度洋回归、不参与全球数值复核。
   `--raw-dir` 只影响 compute/verify；`fetch_data.py` 只写默认缓存，自定义目录时请配 `--skip-download`。
@@ -193,13 +204,13 @@
 
 | 图 | 内容 |
 | --- | --- |
-| `global_sst_vs_latitude.png` | 90°S–90°N 年均 / 1 月 / 7 月曲线 + 右侧双比例面板（蓝=海洋占比 `valid/1440`，橙=有数据比例 `valid/ocean_grid_count`）；年均 **25 °C 等温线的南北半球交点同时标注**；海洋占比 < 10% 的纬度灰底不画 |
+| `global_sst_vs_latitude.png` | 90°S–90°N 年均 / 1 月 / 7 月曲线 + 右侧双比例面板（蓝=海洋占比 `valid/1440`，橙=有数据比例 `valid/ocean_grid_count`）；年均 **25 °C 等温线的南北半球交点同时标注**；新列到位时并列显示**无冰虚线**、空间 P10–P90 灰带、5 年年际 ±1σ 橙带、**真实最暖/最冷月**淡线及 `ice_frac` 海冰斜纹带；海洋占比 < 10% 的纬度灰底不画 |
 | `basins_sst_vs_latitude.png` | 五大洋分盆年均曲线 + 旧印度洋结果（灰色点划线）对照；门槛用 `valid_count/1440` 现算；右面板为 1 月（实线）/ 7 月（虚线），展示南北半球季节反相 |
 | `global_sst_map.png` | **5760×2880（4K）** 0.25° 全球年均 SST 等经纬（Plate Carrée）地图；15°/30° 经纬网、0/10/15/20/25/28 °C 六档等值线（25 加粗并标注）、中文海区/洋流/五大洋标注、内陆湖灰色。**未引入 cartopy** |
 | `global_sst_map_regions.png` | 6 个重点海域 2×3 放大图（东亚、珊瑚三角、印度洋北部、地中海/黑海、加勒比/墨西哥湾、西太平洋暖池），0.25° 原生、统一色标、15/20/25/28 °C 等值线、中文海区/洋流标注、经纬网与海岸线；距子图边缘 <2.5° 的标注自动隐藏，避免裁字 |
 | `global_sst_map_mollweide.png` | **4800×2400** Mollweide 等面积投影（lon 转 −180…180），陆灰、25 °C 等值线、色标 −2～32 °C；用于面积对比，与等经纬 4K 图并存、不替换 |
-| `global_sst_anomaly.png` | **5760×2880** 同纬度异常 = 年均 SST − 该纬度有效海洋格点算术平均；`RdBu_r` 对称 ±8 °C（超出截断），0 线加粗。**不是相对时间平均** |
-| `global_sst_map.html` | **自包含交互地图**（年均/1月/7月/7月−1月/同纬度异常五图层，int16×100 差分+gzip 内嵌、零网络）：滚轮缩放 / 拖动 / Shift 框选统计 / 双击放大 / 重置 / 快捷跳转 / URL hash 深链；显示经纬度、海盆与年均/1月/7月/温差/异常读数，25 °C 等值线与灰色陆地 |
+| `global_sst_anomaly.png` | **5760×2880** 同纬度异常 = 年均 SST − 该纬度有效海洋格点算术平均；优先 `anomaly_grid.npz`（与 `zonal_ref.csv` 校验 ≤0.01 °C），缺失时本地算；`RdBu_r` 对称 ±8 °C（超出截断），0 线加粗。**不是相对时间平均** |
+| `global_sst_map.html` | **自包含交互地图**（年均/1月/7月/7月−1月/同纬度异常五图层，int16×100 差分+gzip 内嵌、零网络）：滚轮缩放 / 拖动 / Shift 框选统计 / 双击放大 / 重置 / 快捷跳转 / URL hash 深链；显示经纬度、海盆与年均/1月/7月/温差/异常读数，25 °C 等值线与灰色陆地；权威异常场存在时优先内嵌 |
 | `lat_month_heatmap.png` | 全球 12 个月 × 纬度热图，黑色等值线 25 °C，灰色为海洋占比不足的纬度 |
 | `indian_vs_global.png` | 印度洋旧廓线 vs 全球廓线，副图为「印度洋 − 全球」差值（仅重叠纬度、有效值处） |
 
@@ -207,12 +218,12 @@
 
 | 文件 | 像素 | 体积 |
 | --- | --- | --- |
-| `global_sst_vs_latitude.png` | 2198 × 1457 | 347 KB |
+| `global_sst_vs_latitude.png` | 2198 × 1457 | 345 KB |
 | `basins_sst_vs_latitude.png` | 2605 × 1421 | 421 KB |
 | `global_sst_map.png` | 5760 × 2880 | 2128 KB |
 | `global_sst_map_regions.png` | 3784 × 1951 | 924 KB |
 | `global_sst_map_mollweide.png` | 4800 × 2400 | 957 KB |
-| `global_sst_anomaly.png` | 5760 × 2880 | 1502 KB |
+| `global_sst_anomaly.png` | 5760 × 2880 | 1508 KB |
 | `lat_month_heatmap.png` | 2507 × 1318 | 170 KB |
 | `indian_vs_global.png` | 2140 × 1630 | 205 KB |
 | `global_sst_map.html` | — | 2.10 MB |
