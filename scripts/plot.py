@@ -637,6 +637,8 @@ def plot_global_profile(ctx: dict, cov_min: float) -> Path:
             + ("；浅蓝斜纹=海冰覆盖（ice_frac ≥ 15%）" if ice_drawn else "")
             + "。"
         )
+    n_note_lines = note.count("\n") + 1
+    fig.subplots_adjust(bottom=0.075 + 0.022 * n_note_lines)
     fig.text(
         0.01,
         0.005,
