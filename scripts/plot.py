@@ -577,11 +577,11 @@ def plot_basins(ctx: dict, cov_min: float) -> Path:
     ax2.legend(handles=proxy, loc="lower right", framealpha=0.93, fontsize=9)
 
     note = (
-        "注：分海盆边界为近似划分（印度洋 20°E–120°E，太平洋 120°E–280°E，其余归大西洋；"
-        "66°N 以北为北冰洋，60°S 以南为南大洋）。"
-        "曲线门槛统一用海洋占比 valid_count/1440 ≥ "
-        f"{cov_min:.0%}（分盆文件无 zonal_ocean_frac 列时现算），"
-        "coverage（valid_count/ocean_grid_count）只反映冰情/缺测，不用于门槛。"
+        "注：海盆边界按 scripts/basins.py 近似实现：\n"
+        "印太 8°S 以南 120°E、8°S–6°S→105.5°E、6°S–1.5°N→103.5°E、1.5°N 以北 100.5°E（安达曼海归印度洋、南海归太平洋）；"
+        "印大 30°N 以南 20°E、以北 45°E；太西 19–66.5°N 258°E、−60°S 附近 292.75°E；\n"
+        "北冰洋 66.5°N 以北、南大洋 60°S 以南。曲线门槛用海洋占比 valid_count/1440 ≥ "
+        f"{cov_min:.0%}（分盆文件现算），coverage（valid_count/ocean_grid_count）只反映冰情/缺测，不作门槛；"
         "里海/五大湖/拉多加湖共 1302 格按内陆水体剔除。"
     )
     if ctx["synthetic"]:
@@ -601,6 +601,13 @@ def plot_map(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
         grid_mask = npz["basin_mask"].astype(float) if "basin_mask" in npz.files else None
     if annual.shape != (len(lat), len(lon)):
         raise SystemExit(f"climatology_grid.npz 形状异常：{annual.shape} vs lat×lon")
+    if grid_mask is None and ctx["mask_npz"].exists():
+        with np.load(ctx["mask_npz"]) as npz:
+            if "basin_mask" in npz.files:
+                grid_mask = npz["basin_mask"].astype(float)
+    if grid_mask is not None and grid_mask.shape == annual.shape:
+        # 内陆湖（里海/五大湖/拉多加湖）在 basin_mask 中为 0，必须显示为陆地而不是暖色海温
+        annual = np.where(grid_mask > 0, annual, np.nan)
 
     cmap = matplotlib.colormaps["RdYlBu_r"].copy()
     cmap.set_bad("#E6E6E6")
@@ -762,11 +769,12 @@ def plot_indian_vs_global(ctx: dict, cov_min: float) -> Path:
     fig = plt.figure(figsize=(11.8, 8.6))
     gs = fig.add_gridspec(2, 1, height_ratios=[2.5, 1.0], hspace=0.08)
     ax = fig.add_subplot(gs[0, 0])
-    axd = fig.add_subplot(gs[1, 0], sharex=ax)
+    axd = fig.add_subplot(gs[1, 0], sharey=ax)
 
     ax.plot(np.where(ok_glob, sst_glob, np.nan), lat_glob, color="#111111", lw=2.0, label="全球（90°S–90°N）")
     ax.plot(np.where(ok_old, sst_old, np.nan), lat_old, color="#E67E22", lw=2.2,
             label="印度洋（旧结果）")
+    ax.set_xlabel("海表温度 SST（°C）")
     ax.set_ylabel("纬度")
     ax.yaxis.set_major_formatter(FuncFormatter(lat_formatter))
     ax.set_yticks(np.arange(-90, 91, 30))
@@ -777,16 +785,17 @@ def plot_indian_vs_global(ctx: dict, cov_min: float) -> Path:
     subtitle = "合成全球曲线（fixture）" if ctx["synthetic"] else "全球 2016–2020 气候态"
     ax.set_title(f"印度洋（旧结果）与全球年均 SST 廓线对照\n（{subtitle}；印度洋为 20°E–120°E/40°S–30°N）", fontsize=12.5)
     ax.legend(loc="lower right", framealpha=0.93, fontsize=9)
-    ax.tick_params(labelbottom=False)
+    ax.tick_params(labelbottom=True)
 
-    axd.axhline(0.0, color="0.5", lw=0.9)
+    axd.axvline(0.0, color="0.5", lw=0.9)
     axd.plot(np.where(ok_diff, diff, np.nan), lat_old, color="#7D3C98", lw=1.8)
     axd.fill_betweenx(lat_old, 0, np.where(ok_diff, diff, np.nan), color="#BB8FCE", alpha=0.3, lw=0)
-    axd.set_ylabel("差值（°C）", fontsize=9)
-    axd.set_xlabel("纬度")
-    axd.xaxis.set_major_formatter(FuncFormatter(lat_formatter))
-    axd.set_xlim(LAT_MIN - 1.0, LAT_MAX + 1.0)
-    axd.set_xticks(np.arange(-90, 91, 30))
+    axd.set_xlabel("差值（°C）", fontsize=9)
+    axd.set_ylabel("纬度", fontsize=9)
+    diff_abs = np.nanmax(np.abs(diff[ok_diff])) if ok_diff.any() else 0.5
+    lim = max(0.5, 1.15 * float(diff_abs))
+    axd.set_xlim(-lim, lim)
+    axd.tick_params(axis="x", labelsize=9)
     axd.grid(True, ls=":", lw=0.8, alpha=0.55)
     axd.set_axisbelow(True)
     axd.set_title("印度洋 − 全球（重叠纬度，正值 = 印度洋更暖）", fontsize=9.5, pad=4)

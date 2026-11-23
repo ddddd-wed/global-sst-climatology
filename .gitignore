@@ -19,3 +19,6 @@ figures/*.png.tmp
 
 # analysis side: generated verification report (not committed)
 data/verify_report.json
+
+# fixture dev figures (local only)
+figures/dev/

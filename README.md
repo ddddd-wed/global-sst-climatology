@@ -21,7 +21,7 @@
   <https://coastwatch.pfeg.noaa.gov/erddap/griddap/ncdcOisst21Agg.csv>
 - **每个时次的请求**（原生 0.25°，不加 stride，全球范围）：
   ```
-  ?sst[(YYYY-MM-16T12:00:00Z):1:(YYYY-MM-16T12:00:00Z)][(0.0):1:(0.0)][(-90.0):1:(90.0)][(0.0):1:(359.75)]
+  ?sst[(YYYY-MM-16T12:00:00Z):1:(YYYY-MM-16T12:00:00Z)][(0.0):1:(0.0)][(-89.875):1:(89.875)][(0.125):1:(359.875)]
   ```
 - **时次**：2016–2020 年，每月 16 日 12:00 UTC 一个时次，共 **60 个**。
 - **返回规模**：2 行表头 + 720 × 1440 = 1,036,800 行数据。**实测体积**：单时次 CSV **45.8 MB**；
@@ -51,7 +51,7 @@
 │   ├── global_sst_map.png
 │   ├── lat_month_heatmap.png
 │   ├── indian_vs_global.png
-│   ├── dev/                      # fixture 自测图（合成数据，带水印，可入库）
+│   ├── dev/                      # fixture 自测图（合成数据；已 gitignore，不入库）
 │   ├── sst_vs_latitude.png       # 旧印度洋曲线（保留）
 │   └── lat_month_heatmap_indian.png  # 旧印度洋热图（保留；全局同名图占用了 lat_month_heatmap.png）
 ├── scripts/
@@ -187,12 +187,13 @@
 | 文件 | 像素 | 体积 |
 | --- | --- | --- |
 | `global_sst_vs_latitude.png` | 2198 × 1457 | 347 KB |
-| `basins_sst_vs_latitude.png` | 3750 × 1421 | 430 KB |
-| `global_sst_map.png` | 2215 × 1187 | 589 KB |
+| `basins_sst_vs_latitude.png` | 2605 × 1421 | 421 KB |
+| `global_sst_map.png` | 2215 × 1187 | 586 KB |
 | `lat_month_heatmap.png` | 2507 × 1318 | 170 KB |
-| `indian_vs_global.png` | 2167 × 1630 | 192 KB |
+| `indian_vs_global.png` | 2140 × 1630 | 218 KB |
 
-`figures/dev/` 仍保留 fixture 自测图（带「合成数据」水印），仅用于无真实数据时的开发自测，不用于任何结论。
+`figures/dev/` 仅作为本地 fixture 自测输出（带「合成数据」水印），已在 `.gitignore` 中排除、不跟踪，
+不用于任何结论。
 正式图图注已写明：里海（719 格）+ 北美五大湖（531 格）+ 拉多加湖（52 格）共 **1302** 个内陆水体格点
 按 `basin_mask=0` 剔除；`coverage = valid_count/ocean_grid_count`，
 曲线绘制阈值看 `zonal_ocean_frac = valid_count/1440`。
@@ -285,9 +286,14 @@ fixture 自测仍保留：`verify.py --data-dir .tmp/fixture --skip-online` →
 - **10% 海洋占比阈值与极地海冰**：北冰洋冬季、南大洋高纬在 60 个时次平均后有效海洋格点可能低于 10%，
   这些纬度不绘制；阈值附近结果对阈值敏感。注意这里用的是 `zonal_ocean_frac = valid_count/1440`，
   不是 `coverage`（有数据比例）。
-- **海盆边界是近似划分**：印度洋 20°E–120°E、太平洋 120°E–280°E，其余归大西洋，66°N 以北为北冰洋、
-  60°S 以南为南大洋；与正式海盆定义存在差异，分盆均温只用于量级对比。`basin_mask.npz` 的海盆边界
-  只用于地图示意。
+- **海盆边界是近似划分**（按 `scripts/basins.py` 实际实现）：
+  - 印度洋–太平洋：8°S 以南 120°E；8°S–6°S 线性过渡到 105.5°E，6°S–1.5°N 继续过渡到
+    103.5°E，1.5°N 以北 100.5°E（沿马来半岛；安达曼海归印度洋、南海归太平洋）；
+  - 印度洋–大西洋：30°N 以南 20°E，30°N 以北 45°E（地中海东段与黑海归大西洋）；
+  - 太平洋–大西洋：19°N–66.5°N 用 258°E（102°W 美洲分水岭），−60°S 附近 292.75°E
+    （德雷克海峡；−55°S–8.5°N、8.5°N–19°N 为过渡段）；
+  - 北冰洋 = 66.5°N 以北，南大洋 = 60°S 以南。
+  与正式海盆定义仍有差异，分盆均温只用于量级对比；`basin_mask.npz` 的海盆边界只用于地图示意。
 - **每月只取 16 日一个时次**：不能代表整月平均，也不反映 MJO、季节内振荡；5 年气候态仍受 ENSO/IOD 影响。
 - **0.25°（约 28 km）分辨率**无法解析近岸、海峡和海湾；OISST 近岸为插值/掩膜结果，存在不确定性。
 - **纬向平均抹平经向差异**：不能替代阿拉伯海、孟加拉湾、副热带环流等区域分析。
@@ -305,7 +311,7 @@ fixture 自测仍保留：`verify.py --data-dir .tmp/fixture --skip-online` →
 - **`data/zonal_mean_global.csv` / `zonal_mean_basins.csv` / `climatology_grid.npz` 入库**（数据侧产出），
   是全部全球结论的数值基础。
 - **`data/zonal_mean.csv` 入库**：旧印度洋 281 行结果，作为回归基准保留。
-- **`figures/` 五张全球 PNG 入库**；`figures/dev/` 的 fixture 图可入库但单图 < 2 MB，且必须保留合成水印。
+- **`figures/` 五张全球 PNG 入库**；`figures/dev/` 的 fixture 图本地生成但不入库（已 gitignore）。
 - **`data/verify_report.json` 不入库**（`.gitignore` 已忽略），由 `verify.py` 随时重新生成。
 - 原始 CSV 未压缩约 2.75 GB，故以 gzip 无损压缩保存；读取时解压，内容不变。
 
