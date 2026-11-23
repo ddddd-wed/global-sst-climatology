@@ -493,7 +493,8 @@ def plot_global_profile(ctx: dict, cov_min: float) -> Path:
         "注：纬向平均为同一纬度圈内有效海洋格点（非陆地/海冰）的算术平均，未乘 cosφ；\n"
         f"海洋占比 zonal_ocean_frac = 有效格点数 / {N_LON_GLOBAL}，曲线只画 ≥ {cov_min:.0%} 的纬度；"
         "有数据比例 coverage = 有效格点数 / ocean_grid_count（非海冰/非缺测），仅用于副图展示。\n"
-        "里海、北美五大湖按内陆水体剔除（basin_mask=0），不算海洋格点；45–50°N 的海洋占比因此偏低。",
+        "里海 719 + 北美五大湖 531 + 拉多加湖 52 = 1302 个内陆水体格点按 basin_mask=0 剔除；"
+        "45–50°N 的海洋占比因此偏低。",
         fontsize=8.3,
         color="0.35",
         va="bottom",
@@ -581,6 +582,7 @@ def plot_basins(ctx: dict, cov_min: float) -> Path:
         "曲线门槛统一用海洋占比 valid_count/1440 ≥ "
         f"{cov_min:.0%}（分盆文件无 zonal_ocean_frac 列时现算），"
         "coverage（valid_count/ocean_grid_count）只反映冰情/缺测，不用于门槛。"
+        "里海/五大湖/拉多加湖共 1302 格按内陆水体剔除。"
     )
     if ctx["synthetic"]:
         note += "\n本图海盆曲线为合成 fixture；灰色点划线「印度洋（旧结果）」来自仓库已提交的真实 CSV。"
@@ -664,7 +666,8 @@ def plot_map(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
         0.01,
         0.005,
         "注：未引入 cartopy，采用等经纬（Plate Carrée）投影的 pcolormesh；"
-        f"色标固定 −2～32 °C；{boundary_note}；里海、北美五大湖按内陆水体剔除（basin_mask=0）。",
+        f"色标固定 −2～32 °C；{boundary_note}；里海 719 + 北美五大湖 531 + 拉多加湖 52 = 1302 个"
+        "内陆水体格点按 basin_mask=0 剔除。",
         fontsize=8.4,
         color="0.35",
         va="bottom",
@@ -723,7 +726,7 @@ def plot_heatmap(ctx: dict, cov_min: float) -> Path | None:
         0.005,
         "注：每格为该纬度圈月度气候态（来自 CSV 的 sst_MM 列）；12 个月等权平均得年均；"
         f"海洋占比 valid/{N_LON_GLOBAL} 不足的纬度置灰，不参与曲线与结论；"
-        "灰色不代表冰情，coverage 见廓线副图。",
+        "灰色不代表冰情，coverage 见廓线副图；里海/五大湖/拉多加湖共 1302 格按内陆水体剔除。",
         fontsize=8.4,
         color="0.35",
         va="bottom",

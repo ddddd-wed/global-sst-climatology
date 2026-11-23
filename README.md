@@ -5,13 +5,13 @@
 「月份 × 纬度」热图；并提供一套**不依赖 `compute.py`** 的独立复核脚本。旧的印度洋（20°E–120°E、
 40°S–30°N）结果原样保留在[附录](#附录印度洋旧结果20162020)中，作为回归基准。
 
-> **当前状态**：分析/绘图/复核代码已完成；真实全球数据由数据侧在并行分支产出，**全球关键结果数字与正式图件
-> 待真实数据到位后再填入**（本文不填任何未经验证的全球数值）。下面展示的图均来自 `figures/dev/` 的
-> **合成 fixture**，只用于开发自测，**不是观测结果**。
+> **当前状态**：数据侧全球结果已合入 master（fe3a68b，720×32 / 2215×32 / 5.0 MB npz 等全部入库），
+> 本分支已 rebase 到该提交；`figures/` 下 5 张正式图与下方关键结果均由这批真实数据产出，
+> `scripts/verify.py` 的完整复核（60 时次 raw 重算 + ERDDAP 在线抽样）6 项全部 PASS。
 
-![全球 SST–纬度廓线（合成 fixture 示意图）](figures/dev/global_sst_vs_latitude.png)
+![全球 SST–纬度廓线](figures/global_sst_vs_latitude.png)
 
-*图：合成 fixture 生成的全球纬向平均廓线示意（红字水印标明合成数据）。真实结果见 `figures/global_sst_vs_latitude.png`。*
+*图：2016–2020 全球纬向平均海表温度；黑=年均，蓝=1 月，红=7 月，右侧副图为海洋占比与 coverage。*
 
 ## 1. 数据来源
 
@@ -52,7 +52,8 @@
 │   ├── lat_month_heatmap.png
 │   ├── indian_vs_global.png
 │   ├── dev/                      # fixture 自测图（合成数据，带水印，可入库）
-│   └── sst_vs_latitude.png       # 旧印度洋两张图（保留）
+│   ├── sst_vs_latitude.png       # 旧印度洋曲线（保留）
+│   └── lat_month_heatmap_indian.png  # 旧印度洋热图（保留；全局同名图占用了 lat_month_heatmap.png）
 ├── scripts/
 │   ├── config.py                 # 数据侧维护：路径、全球范围、时间、阈值
 │   ├── fetch_data.py             # 数据侧维护：按月下载 / 校验 / gzip 缓存
@@ -129,8 +130,9 @@
 .venv\Scripts\python.exe scripts\compute.py
 .venv\Scripts\python.exe scripts\plot.py
 
-# 分析侧独立复核（不 import compute.py）
+# 分析侧独立复核（不 import compute.py；raw 未入库时用 --raw-dir 指向缓存）
 .venv\Scripts\python.exe scripts\verify.py
+.venv\Scripts\python.exe scripts\verify.py --raw-dir <raw_global 目录> --report .tmp\verify_report_final.json
 .venv\Scripts\python.exe scripts\verify.py --skip-online   # 不联网
 ```
 
@@ -160,17 +162,20 @@
 | `lat_month_heatmap.png` | 全球 12 个月 × 纬度热图，黑色等值线 25 °C，灰色为海洋占比不足的纬度 |
 | `indian_vs_global.png` | 印度洋旧廓线 vs 全球廓线，副图为「印度洋 − 全球」差值（仅重叠纬度、有效值处） |
 
-当前 `figures/dev/` 中 fixture 自测图的实测尺寸/体积（单图均 < 2 MB）：
+`figures/` 中正式图的实测尺寸/体积（真实数据模式，单图均 < 2 MB）：
 
 | 文件 | 像素 | 体积 |
 | --- | --- | --- |
-| `global_sst_vs_latitude.png` | 2404 × 1457 | 378 KB |
-| `basins_sst_vs_latitude.png` | 3227 × 1421 | 417 KB |
-| `global_sst_map.png` | 2376 × 1187 | 300 KB |
-| `lat_month_heatmap.png` | 2482 × 1318 | 220 KB |
-| `indian_vs_global.png` | 2364 × 1630 | 249 KB |
+| `global_sst_vs_latitude.png` | 2198 × 1457 | 347 KB |
+| `basins_sst_vs_latitude.png` | 3750 × 1421 | 430 KB |
+| `global_sst_map.png` | 2215 × 1187 | 589 KB |
+| `lat_month_heatmap.png` | 2507 × 1318 | 170 KB |
+| `indian_vs_global.png` | 2167 × 1630 | 192 KB |
 
-> 以上尺寸来自合成 fixture；真实数据到位后正式图可能因数值范围略有变化。图中红字水印表明合成数据身份。
+`figures/dev/` 仍保留 fixture 自测图（带「合成数据」水印），仅用于无真实数据时的开发自测，不用于任何结论。
+正式图图注已写明：里海（719 格）+ 北美五大湖（531 格）+ 拉多加湖（52 格）共 **1302** 个内陆水体格点
+按 `basin_mask=0` 剔除；`coverage = valid_count/ocean_grid_count`，
+曲线绘制阈值看 `zonal_ocean_frac = valid_count/1440`。
 
 ## 7. 独立复核（`scripts/verify.py`）
 
@@ -179,9 +184,10 @@
 1. **数值复算**：读取 `data/raw/`（或 `--raw-dir`）的 60 个 `csv.gz`，独立重算「逐时次纬向平均 →
    同月多年平均 → 12 月等权年均」，抽 **8 个纬度（-70/-45/-20/0/20/40/60/75°）× 1 月、7 月** 与
    `zonal_mean_basins.csv` 的 `global` 行按纬度对齐，容差 **0.01 °C**；年均同纬度一并比对。
-   统计域用 `basin_mask.npz::basin_mask`（或 `basin_id`）剔除**里海（719 格）与北美五大湖（531 格）**
-   等内陆水体，否则 45–50°N 的纬向平均会系统性偏高 0.3 °C 左右。raw 文件里仍有这些水体的原始温度，
-   是**按掩膜排除**、不是数据缺失；**SST 均值本身仍由 `verify.py` 从 raw 独立计算**。
+   统计域用 `basin_mask.npz::basin_mask`（或 `basin_id`）剔除**里海（719 格）、北美五大湖（531 格）、
+   拉多加湖（52 格）共 1302 个内陆水体格点**，否则 45–50°N 的纬向平均会明显偏差（45.375°N 的 1 月
+   可达 0.38 °C、7 月 0.49 °C）。raw 文件里仍有这些水体的原始温度，是**按掩膜排除**、不是数据缺失；
+   **SST 均值本身仍由 `verify.py` 从 raw 独立计算**。
    月度列缺失时自动只比年均。
 2. **结构性检查**：720 行、0.25° 步长、纬度单调；新增列自洽——
    `coverage ≈ valid_count / ocean_grid_count`、`zonal_ocean_frac ≈ valid_count / 1440`、
@@ -199,41 +205,58 @@
 6. 结果写入 `data/verify_report.json`（或 `--report` 指定路径），打印汇总；
    **实际比对失败才非零退出**，数据未就绪/网络不通只记 `skip`。
 
-当前工作区（真实全球数据未就绪）实测：
+真实数据最终复核（60 个 raw 时次 + ERDDAP 在线抽样，耗时约 **20.9 s**）：
 
 ```text
-[SKIP] zonal_mean_global.csv 结构          # 真实数据未就绪
-[SKIP] zonal_mean_basins.csv 结构          # 真实数据未就绪
-[SKIP] climatology_grid.npz 一致性         # 真实数据未就绪
-[SKIP] data/raw 独立数值复算               # 无 60 个 raw 文件
-[SKIP] ERDDAP 在线抽样复核                 # 无同时次 raw 可比对
-[PASS] 印度洋旧结果回归                     # 29.14 °C @ 2.12°N；21.66°S；26.16 °C
-结论：pass_with_skips（通过 1 / 失败 0 / 跳过 5），退出码 0
+$ python scripts/verify.py --raw-dir <...>\raw_global --report .tmp\verify_report_final.json
+统计域掩膜：basin_mask.npz::basin_mask（剔除内陆湖泊/陆地）
+[PASS] zonal_mean_global.csv 结构
+[PASS] zonal_mean_basins.csv 结构（674/506/506/361/94/74 行，按纬度对齐）
+[PASS] climatology_grid.npz 一致性
+[PASS] data/raw 独立数值复算（24 个比对，最大偏差 0.0005 °C）
+[PASS] ERDDAP 在线抽样复核（3 时次 × 18 样本，最大偏差 0.0000 °C）
+[PASS] 印度洋旧结果回归（29.14 °C @ 2.12°N；21.66°S；26.16 °C）
+结论：pass（通过 6 / 失败 0 / 跳过 0），退出码 0
 ```
 
-fixture 自测：`verify.py --data-dir .tmp/fixture --skip-online` →
-`pass_with_skips（通过 4 / 失败 0 / 跳过 2）`，退出码 0；结构性检查覆盖
+fixture 自测仍保留：`verify.py --data-dir .tmp/fixture --skip-online` →
+`pass_with_skips（通过 4 / 失败 0 / 跳过 2）`；结构性检查覆盖
 `coverage = valid/ocean_grid_count`、`zonal_ocean_frac = valid/1440`、`cov_MM`/`sst_MM` NaN 模式、
 按纬度对齐的 basins 行对齐与缺失行断言。
 单元测试 15 项（等温线双交点、印度洋回归、raw 重算往返/掩膜剔除、60 时次全流程、
 覆盖率/海洋占比/NaN 模式自洽与破坏检测、basins 缺行断言、无月度键网格）全部通过。
 
-## 8. 关键结果（待真实数据填入）
+## 8. 关键结果
 
-> 数据侧产出 `zonal_mean_global.csv` / `zonal_mean_basins.csv` / `climatology_grid.npz` 后，
-> 运行 `plot.py` 与 `verify.py` 填入下列数字；**在此之前不填任何推测值**。
+> 以下数字全部来自本次真实数据运行（`scripts/plot.py` 生成正式图；`scripts/verify.py` 6 项 PASS），
+> 并与 `data/summary_metrics.json` 逐项交叉核对：66 项中 **0 项超差**（温度容差 0.01 °C、纬度容差 0.05°）。
 
-- 全球年均 SST 最高值及所在纬度：待填
-- 年均 25 °C 等温线（北半球 / 南半球）：待填
-- 五大洋 cos(lat)*valid_count 加权年均 SST：待填
-- 海洋占比最低的纬度及数值（10% 门槛附近，勿与 coverage 混淆）：待填
-- 1 月 / 7 月季节振幅随纬度变化：待填
+- **全球年均 SST 最高 28.63 °C，出现在 5.875°N**；最低 **−1.70 °C，出现在 89.625°N**（北冰洋高纬）。
+- **年均 25 °C 等温线：北半球 25.55°N、南半球 19.53°S**；
+  **0 °C 等温线：北半球 75.97°N、南半球 62.26°S**。
+- **有效纬度范围：78.375°S – 89.875°N**（46 个 `ocean_grid_count=0` 的南极大陆圈纬度不输出）。
+- **全球 / 五大洋 cos(lat)·valid_count 加权年均 SST**：
+
+  | 海盆 | 年均 SST（°C） |
+  | --- | --- |
+  | 全球 | 18.49 |
+  | 太平洋 | 21.18 |
+  | 大西洋 | 19.00 |
+  | 印度洋 | 20.59 |
+  | 北冰洋 | 0.22 |
+  | 南大洋 | −0.74 |
+
+- **季节振幅随纬度增大**：42.125°N 处最大，1 月 10.66 °C / 7 月 18.33 °C（振幅 7.67 °C）；
+  赤道 0.125°N 仅 1 月 27.85 °C / 7 月 27.26 °C（振幅 0.59 °C）；20.125°S 为 1 月 26.19 °C /
+  7 月 23.42 °C（南半球反相）。
+- **内陆水体**：里海 719 + 五大湖 531 + 拉多加湖 52 = **1302 格** 按 `basin_mask=0` 剔除；
+  raw 中这些格点仍有温度，但不进入纬向平均。
 
 ## 9. 已知局限
 
-- **内陆水体按掩膜剔除**：里海（719 格）与北美五大湖（531 格）在 `basin_mask` 中为 0（陆地），
-  raw 中虽有非 NaN 温度但不参与纬向平均；因此 45–50°N 的 `zonal_ocean_frac` 会比不剔除时低，
-  这是正确口径，不是异常。
+- **内陆水体按掩膜剔除**：里海（719 格）、北美五大湖（531 格）、拉多加湖（52 格）共 1302 格在
+  `basin_mask` 中为 0（陆地），raw 中虽有非 NaN 温度但不参与纬向平均；因此 45–50°N 的
+  `zonal_ocean_frac` 会比不剔除时低，这是正确口径，不是异常。
 - **10% 海洋占比阈值与极地海冰**：北冰洋冬季、南大洋高纬在 60 个时次平均后有效海洋格点可能低于 10%，
   这些纬度不绘制；阈值附近结果对阈值敏感。注意这里用的是 `zonal_ocean_frac = valid_count/1440`，
   不是 `coverage`（有数据比例）。
@@ -270,7 +293,7 @@ fixture 自测：`verify.py --data-dir .tmp/fixture --skip-online` →
 
 ![印度洋 SST–纬度曲线](figures/sst_vs_latitude.png)
 
-![印度洋月份–纬度热图](figures/lat_month_heatmap.png)
+![印度洋月份–纬度热图](figures/lat_month_heatmap_indian.png)
 
 旧口径：0.25° 原生格点 **401 列 × 281 行**（20.125–120.125°E、-39.875–30.125°N），
 `coverage = valid_count / 401`，12 个月等权年均，覆盖率 < 10% 不绘制。
