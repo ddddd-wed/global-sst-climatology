@@ -1,17 +1,23 @@
 # 全球海表温度随纬度变化（2016–2020 气候态）—— 全球 + 五大洋
 
 用 NOAA OISST v2.1 的 **0.25° 日平均海表温度**，对全球 **90°S–90°N、0–360°E** 的 60 个月度时次做纬向平均，
-得到 720 个纬度圈的年均 / 1 月 / 7 月 SST 廓线、五大洋分盆对比、全球 0.25° 年均 SST 地图与
-「月份 × 纬度」热图；并提供一套**不依赖 `compute.py`** 的独立复核脚本。旧的印度洋（20°E–120°E、
-40°S–30°N）结果原样保留在[附录](#附录印度洋旧结果20162020)中，作为回归基准。
+得到 720 个纬度圈的年均 / 1 月 / 7 月 SST 廓线、五大洋分盆对比、全球 0.25° 年均 SST 地图
+（4K 静态图 + 重点海域放大 + 可缩放交互 HTML）与「月份 × 纬度」热图；并提供一套**不依赖 `compute.py`**
+的独立复核脚本。旧的印度洋（20°E–120°E、40°S–30°N）结果原样保留在[附录](#附录印度洋旧结果20162020)中，
+作为回归基准。
 
 > **当前状态**：数据侧全球结果已合入 master（fe3a68b，720×32 / 2215×32 / 5.0 MB npz 等全部入库），
-> 本分支已 rebase 到该提交；`figures/` 下 5 张正式图与下方关键结果均由这批真实数据产出，
+> 本分支已 rebase 到该提交；`figures/` 下 6 张正式静态图 + 1 个交互 HTML 与下方关键结果均由这批真实数据产出，
 > `scripts/verify.py` 的完整复核（60 时次 raw 重算 + ERDDAP 在线抽样）6 项全部 PASS。
 
 ![全球 SST–纬度廓线](figures/global_sst_vs_latitude.png)
 
 *图：2016–2020 全球纬向平均海表温度；黑=年均，蓝=1 月，红=7 月，右侧副图为海洋占比与 coverage。*
+
+![全球 SST 地图（4K）](figures/global_sst_map.png)
+
+*图：0.25° 全球年均 SST 4K 地图；白色/灰色为陆地/内陆湖，黑线为 25 °C 等值线。更细查看请打开
+[`figures/global_sst_map.html`](figures/global_sst_map.html) 交互地图。*
 
 ## 1. 数据来源
 
@@ -49,6 +55,8 @@
 │   ├── global_sst_vs_latitude.png
 │   ├── basins_sst_vs_latitude.png
 │   ├── global_sst_map.png
+│   ├── global_sst_map_regions.png
+│   ├── global_sst_map.html
 │   ├── lat_month_heatmap.png
 │   ├── indian_vs_global.png
 │   ├── dev/                      # fixture 自测图（合成数据；已 gitignore，不入库）
@@ -60,6 +68,7 @@
 │   ├── compute.py                # 数据侧维护：raw → zonal_mean_global/basins + npz
 │   ├── run_all.py                # 本分支：全球版一键 下载→计算→绘图→独立复核→验收
 │   ├── plot.py                   # 本分支：全球版绘图（真实数据缺失时自动用 fixture）
+│   ├── make_map_viewer.py        # 本分支：生成自包含交互地图 HTML（float16 + canvas）
 │   ├── verify.py                 # 本分支：独立复核（不 import compute.py）
 │   └── make_fixture.py           # 本分支：生成合成 fixture（只写 .tmp/）
 └── tests/
@@ -67,7 +76,7 @@
 ```
 
 > 协作边界：`config.py` / `fetch_data.py` / `compute.py` 与 `data/` 下的真实数据由**数据侧**维护；
-> `plot.py` / `verify.py` / `make_fixture.py` / `run_all.py` / `tests/` 为本分支维护。
+> `plot.py` / `verify.py` / `make_fixture.py` / `make_map_viewer.py` / `run_all.py` / `tests/` 为本分支维护。
 
 ## 3. 数据契约
 
@@ -137,13 +146,16 @@
 ```
 
 - `run_all.py` 任一步非零立即停止；最后验收：`zonal_mean_global.csv` 720×32（前 7 列契约）、
-  `zonal_mean_basins.csv` 6 个海盆、`climatology_grid.npz` 720×1440（约 5 MB）、5 张正式图
+  `zonal_mean_basins.csv` 6 个海盆、`climatology_grid.npz` 720×1440（约 5 MB）、6 张正式图
   PNG 合法且 >100 KB、`summary_metrics.json` 含 `basins.global.mean_sst_cos_weighted`、
-  `verify.py` **6 项全 PASS**，并打印旧印度洋回归三项数值。
-- **耗时**（本机实测，raw 已缓存）：下载校验 **2.6 s**、计算 **15.1 s**、绘图 **3.4 s**、
-  复核 **20.8 s**、总计 **41.9 s**。冷启动联网下载参考约 **139 s**（数据侧实测），
-  计算约 **13 s**、复核约 **21 s**；绘图在数据侧参考约 **1–2 min**，本机实测 **3.4 s**
-  （首次字体缓存/较慢机器会更久）。
+  `verify.py` **6 项无失败**（在线抽样网络不可用时可 SKIP），并打印旧印度洋回归三项数值。
+- **耗时**（本机实测，raw 已缓存）：下载校验 **2.6 s**、计算 **14.9 s**、绘图 **4.4 s**、
+  复核 **21.3 s**、总计 **43.2 s**。冷启动联网下载参考约 **139 s**（数据侧实测），
+  计算约 **13 s**、复核约 **21 s**；绘图在数据侧参考约 **1–2 min**，本机实测 4.4 s
+  （含 4K 地图与 6 宫格放大图；首次字体缓存/较慢机器会更久）。
+- **交互地图**：`scripts/make_map_viewer.py` 读取 `climatology_grid.npz` / `basin_mask.npz`，
+  把 `sst_annual` 转成 float16 + base64 内嵌到 `figures/global_sst_map.html`（约 2.83 MB），
+  浏览器本地 canvas 重绘；滚轮缩放/拖动/双击放大/重置，无需网络。
 - **缓存目录**：全球 raw 在 `data/raw_global/`（60 个 `sst_YYYY_MM.csv.gz`，约 252 MB），
   已由 `.gitignore` 忽略、不入库；旧的印度洋缓存是 `data/raw/`，只服务印度洋回归、不参与全球数值复核。
   `--raw-dir` 只影响 compute/verify；`fetch_data.py` 只写默认缓存，自定义目录时请配 `--skip-download`。
@@ -152,6 +164,7 @@
   .venv\Scripts\python.exe scripts\fetch_data.py --region global
   .venv\Scripts\python.exe scripts\compute.py --region global --raw-dir data\raw_global
   .venv\Scripts\python.exe scripts\plot.py
+  .venv\Scripts\python.exe scripts\make_map_viewer.py   # 生成 figures/global_sst_map.html
   .venv\Scripts\python.exe scripts\verify.py --raw-dir data\raw_global --report .tmp\verify_report_final.json
   .venv\Scripts\python.exe scripts\verify.py --skip-online   # 不联网
   ```
@@ -178,19 +191,26 @@
 | --- | --- |
 | `global_sst_vs_latitude.png` | 90°S–90°N 年均 / 1 月 / 7 月曲线 + 右侧双比例面板（蓝=海洋占比 `valid/1440`，橙=有数据比例 `valid/ocean_grid_count`）；年均 **25 °C 等温线的南北半球交点同时标注**；海洋占比 < 10% 的纬度灰底不画 |
 | `basins_sst_vs_latitude.png` | 五大洋分盆年均曲线 + 旧印度洋结果（灰色点划线）对照；门槛用 `valid_count/1440` 现算；右面板为 1 月（实线）/ 7 月（虚线），展示南北半球季节反相 |
-| `global_sst_map.png` | 0.25° 全球年均 SST 等经纬（Plate Carrée）地图，色标固定 −2～32 °C，叠加 25 °C 等值线与 `basin_mask.npz` 海盆边界。**未引入 cartopy**，图注中说明投影 |
+| `global_sst_map.png` | **5760×2880（4K）** 0.25° 全球年均 SST 等经纬（Plate Carrée）地图，色标固定 −2～32 °C，叠加 25 °C 等值线与 `basin_mask.npz` 海盆边界，内陆湖显示为灰色。**未引入 cartopy** |
+| `global_sst_map_regions.png` | 6 个重点海域 2×3 放大图（东亚、珊瑚三角、印度洋北部、地中海/黑海、加勒比/墨西哥湾、西太平洋暖池），0.25° 原生、统一色标、25 °C 等值线、0.25° 海岸/内陆湖轮廓 |
+| `global_sst_map.html` | **自包含交互地图**（float16 内嵌、零网络）：滚轮缩放 / 拖动 / 双击放大 / 重置，显示经纬度与 SST 读数，25 °C 等值线与灰色陆地，任意缩放保持 0.25° 清晰度 |
 | `lat_month_heatmap.png` | 全球 12 个月 × 纬度热图，黑色等值线 25 °C，灰色为海洋占比不足的纬度 |
 | `indian_vs_global.png` | 印度洋旧廓线 vs 全球廓线，副图为「印度洋 − 全球」差值（仅重叠纬度、有效值处） |
 
-`figures/` 中正式图的实测尺寸/体积（真实数据模式，单图均 < 2 MB）：
+`figures/` 中正式图的实测尺寸/体积（真实数据模式）：
 
 | 文件 | 像素 | 体积 |
 | --- | --- | --- |
 | `global_sst_vs_latitude.png` | 2198 × 1457 | 347 KB |
 | `basins_sst_vs_latitude.png` | 2605 × 1421 | 421 KB |
-| `global_sst_map.png` | 2215 × 1187 | 586 KB |
+| `global_sst_map.png` | 5760 × 2880 | 1460 KB |
+| `global_sst_map_regions.png` | 3807 × 1951 | 750 KB |
 | `lat_month_heatmap.png` | 2507 × 1318 | 170 KB |
-| `indian_vs_global.png` | 2140 × 1630 | 218 KB |
+| `indian_vs_global.png` | 2140 × 1630 | 205 KB |
+| `global_sst_map.html` | — | 2.83 MB |
+
+> **0.25° ≈ 28 km 是 OISST 数据本身的分辨率上限**：静态地图/放大图只是把原生格点放大到可读像素
+> （4K 地图按 4 px/格目标渲染），交互 HTML 则按当前视口逐像素实时重绘，缩放不会产生插值糊图。
 
 `figures/dev/` 仅作为本地 fixture 自测输出（带「合成数据」水印），已在 `.gitignore` 中排除、不跟踪，
 不用于任何结论。
@@ -311,7 +331,7 @@ fixture 自测仍保留：`verify.py --data-dir .tmp/fixture --skip-online` →
 - **`data/zonal_mean_global.csv` / `zonal_mean_basins.csv` / `climatology_grid.npz` 入库**（数据侧产出），
   是全部全球结论的数值基础。
 - **`data/zonal_mean.csv` 入库**：旧印度洋 281 行结果，作为回归基准保留。
-- **`figures/` 五张全球 PNG 入库**；`figures/dev/` 的 fixture 图本地生成但不入库（已 gitignore）。
+- **`figures/` 六张全球 PNG 与一个交互 HTML 入库**；`figures/dev/` 的 fixture 图本地生成但不入库（已 gitignore）。
 - **`data/verify_report.json` 不入库**（`.gitignore` 已忽略），由 `verify.py` 随时重新生成。
 - 原始 CSV 未压缩约 2.75 GB，故以 gzip 无损压缩保存；读取时解压，内容不变。
 

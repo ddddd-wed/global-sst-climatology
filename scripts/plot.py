@@ -125,13 +125,18 @@ def verify_glyphs(fig: plt.Figure) -> None:
     print(f"  字形检查通过：图中 {len(chars)} 个非 ASCII 字符在 {FONT_NAME} 中均有字形", flush=True)
 
 
-def save_png(fig: plt.Figure, path: Path, dpi: int = DPI) -> tuple[int, int, int]:
+def save_png(
+    fig: plt.Figure,
+    path: Path,
+    dpi: int = DPI,
+    bbox_inches: str | None = "tight",
+) -> tuple[int, int, int]:
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.canvas.draw()
     verify_glyphs(fig)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        fig.savefig(path, dpi=dpi, bbox_inches="tight", facecolor="white")
+        fig.savefig(path, dpi=dpi, bbox_inches=bbox_inches, facecolor="white")
     missing = [str(w.message) for w in caught if "missing from font" in str(w.message)]
     plt.close(fig)
     if missing:
@@ -381,11 +386,17 @@ def resolve_inputs(force_fixture: bool, refresh_fixture: bool) -> dict:
     }
 
 
-def finalize(fig: plt.Figure, ctx: dict, name: str, dpi: int = DPI) -> Path:
+def finalize(
+    fig: plt.Figure,
+    ctx: dict,
+    name: str,
+    dpi: int = DPI,
+    bbox_inches: str | None = "tight",
+) -> Path:
     if ctx["synthetic"]:
         add_synthetic_watermark(fig)
     path = ctx["out_dir"] / name
-    save_png(fig, path, dpi=dpi)
+    save_png(fig, path, dpi=dpi, bbox_inches=bbox_inches)
     return path
 
 
@@ -593,10 +604,11 @@ def plot_basins(ctx: dict, cov_min: float) -> Path:
 # --------------------------------------------------------------------------- #
 # 图 3：全球年均 SST 地图
 # --------------------------------------------------------------------------- #
-def plot_map(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
+def _load_map_data(ctx: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+    """读取地图用经纬度、年均 SST 与 basin_mask>0 的海洋掩膜。"""
     with np.load(ctx["grid_npz"]) as npz:
-        lat = npz["lat"].astype(float)
-        lon = npz["lon"].astype(float)
+        lat = (npz["lat"] if "lat" in npz.files else npz["latitude"]).astype(float)
+        lon = (npz["lon"] if "lon" in npz.files else npz["longitude"]).astype(float)
         annual = npz["sst_annual"].astype(float)
         grid_mask = npz["basin_mask"].astype(float) if "basin_mask" in npz.files else None
     if annual.shape != (len(lat), len(lon)):
@@ -608,26 +620,69 @@ def plot_map(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
     if grid_mask is not None and grid_mask.shape == annual.shape:
         # 内陆湖（里海/五大湖/拉多加湖）在 basin_mask 中为 0，必须显示为陆地而不是暖色海温
         annual = np.where(grid_mask > 0, annual, np.nan)
+    return lat, lon, annual, grid_mask
 
+
+def _map_crop(
+    lat: np.ndarray,
+    lon: np.ndarray,
+    data: np.ndarray,
+    mask: np.ndarray | None,
+    lat_min: float,
+    lat_max: float,
+    lon_min: float,
+    lon_max: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+    """裁剪区域；支持 350–45°E 这种跨 0° 经线范围，返回连续 x 轴（负值表示西经）。"""
+    li = np.where((lat >= lat_min - 1e-6) & (lat <= lat_max + 1e-6))[0]
+    if lon_max <= 360.0:
+        lj = np.where((lon >= lon_min - 1e-6) & (lon <= lon_max + 1e-6))[0]
+        x = lon[lj]
+        blocks = [data[np.ix_(li, lj)]]
+        mask_blocks = [mask[np.ix_(li, lj)]] if mask is not None else []
+    else:
+        j1 = np.where(lon >= lon_min - 1e-6)[0]
+        j2 = np.where(lon < (lon_max - 360.0) - 1e-6)[0]
+        x1 = lon[j1]
+        x2 = lon[j2]
+        x = np.concatenate([x1, x2 + 360.0])
+        x = np.where(x > 180.0, x - 360.0, x)
+        blocks = [data[np.ix_(li, j1)], data[np.ix_(li, j2)]]
+        mask_blocks = [mask[np.ix_(li, j1)], mask[np.ix_(li, j2)]] if mask is not None else []
+        # 350–360 → -10–0，0–45 保持 0–45；拼接顺序正好升序
+    y = lat[li]
+    data_r = np.concatenate(blocks, axis=1)
+    mask_r = np.concatenate(mask_blocks, axis=1) if mask is not None else None
+    if x[0] > x[-1]:  # 理论上不会发生，防御性兜底
+        x = x[::-1]
+        data_r = data_r[:, ::-1]
+        mask_r = mask_r[:, ::-1] if mask_r is not None else None
+    return x, y, data_r, mask_r
+
+
+def _render_global_map(ctx: dict, lat, lon, annual, grid_mask, px_per_cell: int) -> Path:
+    # dpi=400 + figsize=(3.6*px, 1.8*px) → 输出正好 (1440*px) × (720*px) 像素
+    figsize = (3.6 * px_per_cell, 1.8 * px_per_cell)
     cmap = matplotlib.colormaps["RdYlBu_r"].copy()
     cmap.set_bad("#E6E6E6")
-    fig, ax = plt.subplots(figsize=(13.2, 6.8))
-    mesh = ax.pcolormesh(
-        lon,
-        lat,
+    fig, ax = plt.subplots(figsize=figsize)
+    fig.subplots_adjust(left=0.045, right=0.935, bottom=0.11, top=0.90)
+    mesh = ax.imshow(
         np.ma.masked_invalid(annual),
-        shading="nearest",
+        origin="lower",
+        extent=(0.0, 360.0, LAT_MIN, LAT_MAX),
+        aspect="auto",
+        interpolation="nearest",
         cmap=cmap,
         vmin=-2.0,
         vmax=32.0,
-        rasterized=True,
     )
     cb = fig.colorbar(mesh, ax=ax, pad=0.012, aspect=28)
     cb.set_label("海表温度 SST（°C）", fontsize=11)
     cb.set_ticks([-2, 4, 10, 16, 22, 28, 32])
 
     cs = ax.contour(lon, lat, np.ma.masked_invalid(annual), levels=[ISOTHERM_LEVEL],
-                    colors="black", linewidths=1.0)
+                    colors="black", linewidths=0.9)
     ax.clabel(cs, fmt="25 °C", fontsize=8)
 
     boundary_note = "未叠加海盆边界（basin_mask.npz 不存在）"
@@ -638,21 +693,21 @@ def plot_map(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
         with np.load(ctx["mask_npz"]) as npz:
             keys = set(npz.files)
             if "basin_mask" in keys:
-                basin_grid = npz["basin_mask"].astype(float)  # uint8: 0=陆地，1..5=海盆
+                basin_grid = npz["basin_mask"].astype(float)
                 levels = [0.5, 1.5, 2.5, 3.5, 4.5]
                 label = "basin_mask"
             elif "basin_id" in keys:
-                basin_grid = npz["basin_id"].astype(float)    # int8: -1=陆地，0..4=海盆
+                basin_grid = npz["basin_id"].astype(float)
                 levels = [-0.5, 0.5, 1.5, 2.5, 3.5]
                 label = "basin_id"
-    elif grid_mask is not None:
+    if basin_grid is None and grid_mask is not None:
         basin_grid = grid_mask
         levels = [0.5, 1.5, 2.5, 3.5, 4.5]
         label = "climatology_grid.npz::basin_mask"
     if basin_grid is not None and basin_grid.shape == annual.shape:
-        step = 4
+        step = 2
         ax.contour(lon[::step], lat[::step], basin_grid[::step, ::step],
-                   levels=levels, colors="0.25", linewidths=0.35, alpha=0.8)
+                   levels=levels, colors="0.25", linewidths=0.30, alpha=0.85)
         boundary_note = f"细线为海盆边界与海岸线（{label}）"
     elif basin_grid is not None:
         boundary_note = "basin_mask.npz 形状不匹配，未画边界"
@@ -666,20 +721,125 @@ def plot_map(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
     ax.set_xlabel("经度")
     ax.set_ylabel("纬度")
     subtitle = "合成数据（fixture）" if ctx["synthetic"] else "2016–2020 气候态"
-    ax.set_title(f"全球年平均海表温度（0.25° 等经纬网格）\n（{subtitle}，黑色等值线 = 25 °C，灰色 = 陆地/海冰）", fontsize=13)
+    ax.set_title(
+        f"全球年平均海表温度（0.25° 等经纬网格，{1440 * px_per_cell}×{720 * px_per_cell} px）\n"
+        f"（{subtitle}，黑色等值线 = 25 °C，灰色 = 陆地/海冰/内陆湖）",
+        fontsize=13,
+    )
     ax.set_facecolor("#E6E6E6")
 
     fig.text(
         0.01,
         0.005,
-        "注：未引入 cartopy，采用等经纬（Plate Carrée）投影的 pcolormesh；"
-        f"色标固定 −2～32 °C；{boundary_note}；里海 719 + 北美五大湖 531 + 拉多加湖 52 = 1302 个"
-        "内陆水体格点按 basin_mask=0 剔除。",
+        "注：未引入 cartopy，采用等经纬（Plate Carrée）投影的 imshow(nearest)；"
+        f"按 {px_per_cell} px/格目标渲染为 {1440 * px_per_cell}×{720 * px_per_cell} px；"
+        f"色标固定 −2～32 °C；{boundary_note}；\n"
+        "里海 719 + 北美五大湖 531 + 拉多加湖 52 = 1302 个内陆水体格点按 basin_mask=0 剔除。",
         fontsize=8.4,
         color="0.35",
         va="bottom",
     )
-    return finalize(fig, ctx, "global_sst_map.png", dpi=180)
+    if ctx["synthetic"]:
+        add_synthetic_watermark(fig)
+    path = ctx["out_dir"] / "global_sst_map.png"
+    width, height, nbytes = save_png(fig, path, dpi=400, bbox_inches=None)
+    expected = (1440 * px_per_cell, 720 * px_per_cell)
+    if (width, height) != expected:
+        raise RuntimeError(f"地图尺寸 {width}×{height} != 期望 {expected[0]}×{expected[1]}")
+    print(f"  地图按 {px_per_cell} px/格目标渲染，文件 {nbytes / 1e6:.2f} MB", flush=True)
+    return path
+
+
+def plot_map(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
+    lat, lon, annual, grid_mask = _load_map_data(ctx)
+    # 4 px/格 = 5760×2880；>8 MB 时退到 3 px/格 = 4320×2160
+    path = _render_global_map(ctx, lat, lon, annual, grid_mask, 4)
+    if path.stat().st_size > 8 * 1024 * 1024:
+        print("  4 px/格 文件 > 8 MB，回退到 3 px/格", flush=True)
+        path.unlink(missing_ok=True)
+        path = _render_global_map(ctx, lat, lon, annual, grid_mask, 3)
+    if path.stat().st_size > 8 * 1024 * 1024:
+        raise RuntimeError("地图即使降到 3 px/格仍 > 8 MB")
+    return path
+
+
+# --------------------------------------------------------------------------- #
+# 图 3b：重点海域放大图（2×3）
+# --------------------------------------------------------------------------- #
+REGIONS = [
+    ("1 东亚近海（东海/黄海/日本海/南海）", -0.0, 45.0, 100.0, 150.0),
+    ("2 东南亚 / 珊瑚三角", -12.0, 25.0, 95.0, 135.0),
+    ("3 印度洋北部（阿拉伯海/孟加拉湾/红海/波斯湾）", -10.0, 28.0, 35.0, 100.0),
+    ("4 地中海 / 黑海", 28.0, 48.0, 350.0, 405.0),
+    ("5 加勒比 / 墨西哥湾", 5.0, 35.0, 265.0, 315.0),
+    ("6 西太平洋暖池", -15.0, 15.0, 130.0, 180.0),
+]
+
+
+def _region_lon_label(value: float) -> str:
+    if abs(value) < 1e-9:
+        return "0°"
+    return f"{abs(value):.0f}°{'E' if value > 0 else 'W'}"
+
+
+def plot_map_regions(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
+    lat, lon, annual, grid_mask = _load_map_data(ctx)
+    cmap = matplotlib.colormaps["RdYlBu_r"].copy()
+    cmap.set_bad("#D9D9D9")
+    fig, axes = plt.subplots(2, 3, figsize=(19.2, 9.8))
+    fig.subplots_adjust(left=0.035, right=0.985, bottom=0.12, top=0.90, wspace=0.10, hspace=0.30)
+    mesh = None
+    for ax, (title, lat0, lat1, lon0, lon1) in zip(axes.ravel(), REGIONS):
+        x, y, data, mask = _map_crop(lat, lon, annual, grid_mask, lat0, lat1, lon0, lon1)
+        masked = np.ma.masked_invalid(data)
+        mesh = ax.imshow(
+            masked,
+            origin="lower",
+            extent=(x[0] - 0.125, x[-1] + 0.125, y[0] - 0.125, y[-1] + 0.125),
+            aspect="auto",
+            interpolation="nearest",
+            cmap=cmap,
+            vmin=-2.0,
+            vmax=32.0,
+        )
+        cs = ax.contour(x, y, masked, levels=[ISOTHERM_LEVEL], colors="black", linewidths=0.7)
+        ax.clabel(cs, fmt="25", fontsize=5)
+        if mask is not None:
+            ax.contour(x, y, mask, levels=[0.5], colors="0.30", linewidths=0.55)
+        ax.set_xlim(x[0] - 0.125, x[-1] + 0.125)
+        ax.set_ylim(y[0] - 0.125, y[-1] + 0.125)
+        ax.set_facecolor("#D9D9D9")
+        ax.set_xticks(np.linspace(x[0], x[-1], 4))
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _p: _region_lon_label(v)))
+        ax.set_yticks(np.linspace(y[0], y[-1], 4))
+        ax.yaxis.set_major_formatter(FuncFormatter(lat_formatter))
+        ax.tick_params(labelsize=7)
+        ax.set_title(title, fontsize=9.5)
+        ax.grid(True, ls=":", lw=0.5, alpha=0.45, color="0.35")
+        ax.set_axisbelow(True)
+    cax = fig.add_axes([0.30, 0.065, 0.40, 0.016])
+    cb = fig.colorbar(mesh, cax=cax, orientation="horizontal")
+    cb.set_label("海表温度 SST（°C）", fontsize=9)
+    cb.ax.tick_params(labelsize=8)
+    subtitle = "合成数据（fixture）" if ctx["synthetic"] else "2016–2020 气候态"
+    fig.suptitle(
+        f"全球 0.25° 年均 SST 重点海域（{subtitle}；统一色标 −2～32 °C）\n"
+        "黑色细线 = 25 °C 等值线，灰色 = 陆地/内陆湖，深灰轮廓 = basin_mask 海岸线",
+        fontsize=13,
+    )
+    fig.text(
+        0.01,
+        0.005,
+        "注：等经纬（Plate Carrée）原生 0.25° 网格直接放大，每块约 1200×800 px；"
+        "0.25°≈28 km 是数据分辨率上限；里海/五大湖/拉多加湖按 basin_mask=0 剔除。",
+        fontsize=8.2,
+        color="0.35",
+        va="bottom",
+    )
+    return finalize(fig, ctx, "global_sst_map_regions.png", dpi=200)
+
+
+
 
 
 def plot_heatmap(ctx: dict, cov_min: float) -> Path | None:
@@ -859,6 +1019,7 @@ FIGURES = {
     "profile": plot_global_profile,
     "basins": plot_basins,
     "map": plot_map,
+    "regions": plot_map_regions,
     "heatmap": plot_heatmap,
     "indian": plot_indian_vs_global,
 }
@@ -870,7 +1031,7 @@ def main() -> int:
                         help="绘图覆盖率阈值（默认 0.10）")
     parser.add_argument("--fixture", action="store_true", help="强制使用 .tmp/fixture 合成数据")
     parser.add_argument("--refresh-fixture", action="store_true", help="重新生成合成 fixture")
-    parser.add_argument("--figures", default="", help="只画指定图，逗号分隔：profile,basins,map,heatmap,indian")
+    parser.add_argument("--figures", default="", help="只画指定图，逗号分隔：profile,basins,map,regions,heatmap,indian")
     args = parser.parse_args()
 
     cov_min = float(args.coverage_min)
