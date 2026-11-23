@@ -45,9 +45,12 @@ import matplotlib  # noqa: E402
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.patheffects as pe  # noqa: E402
 from matplotlib import font_manager, text as mtext  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.ticker import FuncFormatter  # noqa: E402
+
+from map_labels import labels_in_bbox  # noqa: E402
 
 DATA_DIR = ROOT / "data"
 FIG_DIR = ROOT / "figures"
@@ -67,6 +70,7 @@ N_LON_GLOBAL = 1440          # 0.25° 全球经度格点数，zonal_ocean_frac �
 N_LON_INDIAN = 401           # 旧印度洋文件 0.25° 经度格点数，仅用于旧结果回归
 LAT_MIN, LAT_MAX = -90.0, 90.0
 ISOTHERM_LEVEL = 25.0
+ISOTHERM_LEVELS = [0.0, 10.0, 15.0, 20.0, 25.0, 28.0]
 DPI = 200
 FONT_NAME = "Microsoft YaHei"
 
@@ -604,6 +608,40 @@ def plot_basins(ctx: dict, cov_min: float) -> Path:
 # --------------------------------------------------------------------------- #
 # 图 3：全球年均 SST 地图
 # --------------------------------------------------------------------------- #
+def _draw_map_labels(
+    ax: plt.Axes,
+    labels: list[dict],
+    font_t1: float = 16.0,
+    font_t2: float = 9.5,
+    font_t3: float = 8.0,
+) -> None:
+    """画中文地名/洋流：白色描边，避免压住等温线与色标。"""
+    for lab in labels:
+        kind = lab["kind"]
+        if kind == "ocean":
+            size, weight, style, color = font_t1, "bold", "normal", "#1B2631"
+        elif lab["tier"] == 3:
+            size, weight, style, color = font_t3, "normal", "normal", "#1B2631"
+        elif kind in ("warm", "cold"):
+            size, weight = font_t2, "normal"
+            style, color = "italic", ("#8B1A1A" if kind == "warm" else "#123B6D")
+        else:
+            size, weight, style, color = font_t2, "normal", "normal", "#1B2631"
+        ax.text(
+            lab["lon"],
+            lab["lat"],
+            lab["name"],
+            fontsize=size,
+            fontweight=weight,
+            fontstyle=style,
+            color=color,
+            ha="center",
+            va="center",
+            zorder=30,
+            clip_on=True,
+            path_effects=[pe.withStroke(linewidth=2.4, foreground="white")],
+        )
+
 def _load_map_data(ctx: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     """读取地图用经纬度、年均 SST 与 basin_mask>0 的海洋掩膜。"""
     with np.load(ctx["grid_npz"]) as npz:
@@ -681,9 +719,16 @@ def _render_global_map(ctx: dict, lat, lon, annual, grid_mask, px_per_cell: int)
     cb.set_label("海表温度 SST（°C）", fontsize=11)
     cb.set_ticks([-2, 4, 10, 16, 22, 28, 32])
 
-    cs = ax.contour(lon, lat, np.ma.masked_invalid(annual), levels=[ISOTHERM_LEVEL],
-                    colors="black", linewidths=0.9)
-    ax.clabel(cs, fmt="25 °C", fontsize=8)
+    cs = ax.contour(
+        lon,
+        lat,
+        np.ma.masked_invalid(annual),
+        levels=ISOTHERM_LEVELS,
+        colors="0.28",
+        linewidths=[0.55, 0.55, 0.55, 0.55, 1.7, 0.55],
+        zorder=8,
+    )
+    ax.clabel(cs, levels=[ISOTHERM_LEVEL], fmt="25 °C", fontsize=8, inline_spacing=2)
 
     boundary_note = "未叠加海盆边界（basin_mask.npz 不存在）"
     basin_grid = None
@@ -714,16 +759,28 @@ def _render_global_map(ctx: dict, lat, lon, annual, grid_mask, px_per_cell: int)
 
     ax.set_xlim(0, 360)
     ax.set_ylim(LAT_MIN, LAT_MAX)
-    ax.set_xticks(np.arange(0, 361, 60))
-    ax.set_xticklabels([f"{v:.0f}°" for v in np.arange(0, 361, 60)])
+    ax.set_xticks(np.arange(0, 361, 30))
+    ax.set_xticklabels([f"{v:.0f}°" for v in np.arange(0, 361, 30)])
+    ax.set_xticks(np.arange(15, 360, 30), minor=True)
     ax.set_yticks(np.arange(-90, 91, 30))
+    ax.set_yticks(np.arange(-75, 90, 30), minor=True)
     ax.yaxis.set_major_formatter(FuncFormatter(lat_formatter))
-    ax.set_xlabel("经度")
+    ax.grid(which="major", color="0.70", lw=0.55, alpha=0.85)
+    ax.grid(which="minor", color="0.84", lw=0.32, alpha=0.9)
+    ax.set_axisbelow(True)
+    ax.set_xlabel("经度（15° 网格，30° 深色）")
     ax.set_ylabel("纬度")
+    _draw_map_labels(
+        ax,
+        labels_in_bbox(0.0, 360.0, LAT_MIN, LAT_MAX, include_tier1=True, include_tier2=True,
+                       include_tier3=False, include_currents=True),
+        font_t1=16.0,
+        font_t2=10.0,
+    )
     subtitle = "合成数据（fixture）" if ctx["synthetic"] else "2016–2020 气候态"
     ax.set_title(
         f"全球年平均海表温度（0.25° 等经纬网格，{1440 * px_per_cell}×{720 * px_per_cell} px）\n"
-        f"（{subtitle}，黑色等值线 = 25 °C，灰色 = 陆地/海冰/内陆湖）",
+        f"（{subtitle}；深灰等值线 = 0/10/15/20/25/28 °C，25 °C 加粗；灰色 = 陆地/海冰/内陆湖）",
         fontsize=13,
     )
     ax.set_facecolor("#E6E6E6")
@@ -734,7 +791,8 @@ def _render_global_map(ctx: dict, lat, lon, annual, grid_mask, px_per_cell: int)
         "注：未引入 cartopy，采用等经纬（Plate Carrée）投影的 imshow(nearest)；"
         f"按 {px_per_cell} px/格目标渲染为 {1440 * px_per_cell}×{720 * px_per_cell} px；"
         f"色标固定 −2～32 °C；{boundary_note}；\n"
-        "里海 719 + 北美五大湖 531 + 拉多加湖 52 = 1302 个内陆水体格点按 basin_mask=0 剔除。",
+        "里海 719 + 北美五大湖 531 + 拉多加湖 52 = 1302 个内陆水体格点按 basin_mask=0 剔除；"
+        "0.25°≈28 km 为数据分辨率上限。",
         fontsize=8.4,
         color="0.35",
         va="bottom",
@@ -802,20 +860,37 @@ def plot_map_regions(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
             vmin=-2.0,
             vmax=32.0,
         )
-        cs = ax.contour(x, y, masked, levels=[ISOTHERM_LEVEL], colors="black", linewidths=0.7)
-        ax.clabel(cs, fmt="25", fontsize=5)
+        cs = ax.contour(
+            x,
+            y,
+            masked,
+            levels=[15.0, 20.0, 25.0, 28.0],
+            colors="0.28",
+            linewidths=[0.5, 0.5, 1.1, 0.5],
+        )
+        ax.clabel(cs, levels=[25.0], fmt="25", fontsize=4.5, inline_spacing=1)
         if mask is not None:
             ax.contour(x, y, mask, levels=[0.5], colors="0.30", linewidths=0.55)
+        _draw_map_labels(
+            ax,
+            labels_in_bbox(float(x[0]), float(x[-1]), float(y[0]), float(y[-1]),
+                           include_tier1=False, include_tier2=True, include_tier3=True,
+                           include_currents=True),
+            font_t2=11.0,
+            font_t3=10.0,
+        )
         ax.set_xlim(x[0] - 0.125, x[-1] + 0.125)
         ax.set_ylim(y[0] - 0.125, y[-1] + 0.125)
         ax.set_facecolor("#D9D9D9")
-        ax.set_xticks(np.linspace(x[0], x[-1], 4))
+        xticks = np.arange(np.ceil((x[0] + 1e-9) / 10.0) * 10.0, x[-1] + 1e-9, 10.0)
+        yticks = np.arange(np.ceil((y[0] + 1e-9) / 10.0) * 10.0, y[-1] + 1e-9, 10.0)
+        ax.set_xticks(xticks)
         ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _p: _region_lon_label(v)))
-        ax.set_yticks(np.linspace(y[0], y[-1], 4))
+        ax.set_yticks(yticks)
         ax.yaxis.set_major_formatter(FuncFormatter(lat_formatter))
         ax.tick_params(labelsize=7)
         ax.set_title(title, fontsize=9.5)
-        ax.grid(True, ls=":", lw=0.5, alpha=0.45, color="0.35")
+        ax.grid(True, which="major", ls=":", lw=0.55, alpha=0.55, color="0.35")
         ax.set_axisbelow(True)
     cax = fig.add_axes([0.30, 0.065, 0.40, 0.016])
     cb = fig.colorbar(mesh, cax=cax, orientation="horizontal")
@@ -824,7 +899,7 @@ def plot_map_regions(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
     subtitle = "合成数据（fixture）" if ctx["synthetic"] else "2016–2020 气候态"
     fig.suptitle(
         f"全球 0.25° 年均 SST 重点海域（{subtitle}；统一色标 −2～32 °C）\n"
-        "黑色细线 = 25 °C 等值线，灰色 = 陆地/内陆湖，深灰轮廓 = basin_mask 海岸线",
+        "深灰等值线 = 15/20/25/28 °C（25 °C 加粗），灰色 = 陆地/内陆湖，深灰轮廓 = basin_mask 海岸线",
         fontsize=13,
     )
     fig.text(

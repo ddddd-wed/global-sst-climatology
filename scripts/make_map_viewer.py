@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 """生成自包含的全球 SST 交互地图（离线 HTML，零外部依赖、零网络请求）。
 
-把 ``climatology_grid.npz`` 的 ``sst_annual``（720×1440，float32）转成
-**float16 → base64** 内嵌，浏览器在 ``<canvas>`` 上按当前视口逐像素重绘，
-因此任意缩放级别都保持 0.25° 原生精度。陆地/内陆湖（``basin_mask == 0``）显示为灰色；
-25 °C 等值线由 contourpy 预计算后内嵌。
+内嵌 ``sst_annual`` / ``sst_jan`` / ``sst_jul`` 的 **int16 量化（round(SST×100)，
+-32768 = NaN，解码 /100）**，体积与 float16 相同但精度恒为 0.01 °C。浏览器在
+``<canvas>`` 上按当前视口逐像素重绘，支持年均 / 1 月 / 7 月 / 7 月−1 月四图层，
+叠加 25 °C 等值线、灰色陆地/内陆湖、中文地名与洋流标注。
 
 用法::
 
@@ -19,6 +19,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -33,60 +34,106 @@ matplotlib.use("Agg")
 from contourpy import contour_generator  # noqa: E402
 from matplotlib import colormaps  # noqa: E402
 
+from map_labels import CURRENT_LABELS, OCEAN_LABELS, SEA_LABELS_T2, SEA_LABELS_T3  # noqa: E402
+
 DEFAULT_GRID = ROOT / "data" / "climatology_grid.npz"
 DEFAULT_MASK = ROOT / "data" / "basin_mask.npz"
 DEFAULT_OUT = ROOT / "figures" / "global_sst_map.html"
 VMIN, VMAX = -2.0, 32.0
+DIFF_LIMIT = 12.0
 ISOTHERM = 25.0
 MAX_BYTES = 12 * 1024 * 1024
+BASIN_NAMES = ["陆地", "太平洋", "大西洋", "印度洋", "北冰洋", "南大洋"]
 
 
-def load_annual(grid_path: Path, mask_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def load_layers(grid_path: Path, mask_path: Path) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray], np.ndarray, np.ndarray, dict[str, np.ndarray]]:
     with np.load(grid_path) as npz:
         lat = (npz["lat"] if "lat" in npz.files else npz["latitude"]).astype(np.float64)
         lon = (npz["lon"] if "lon" in npz.files else npz["longitude"]).astype(np.float64)
-        annual = npz["sst_annual"].astype(np.float32)
-    if annual.shape != (len(lat), len(lon)):
-        raise SystemExit(f"sst_annual 形状 {annual.shape} 与 lat/lon 不符")
+        fields = {
+            "annual": npz["sst_annual"].astype(np.float32),
+            "jan": npz["sst_jan"].astype(np.float32) if "sst_jan" in npz.files else None,
+            "jul": npz["sst_jul"].astype(np.float32) if "sst_jul" in npz.files else None,
+        }
+    if fields["jan"] is None or fields["jul"] is None:
+        raise SystemExit("climatology_grid.npz 缺少 sst_jan/sst_jul，无法提供四图层")
+    shape = fields["annual"].shape
+    if shape != (len(lat), len(lon)):
+        raise SystemExit(f"sst 网格形状 {shape} 与 lat/lon 不符")
+
     mask = None
+    basin = np.zeros(shape, dtype=np.uint8)
     if mask_path.exists():
         with np.load(mask_path) as npz:
             if "basin_mask" in npz.files:
-                mask = npz["basin_mask"].astype(np.uint8) > 0
+                bm = npz["basin_mask"].astype(np.uint8)
+                mask = bm > 0
+                if bm.shape == shape:
+                    basin = bm
             elif "basin_id" in npz.files:
-                mask = npz["basin_id"].astype(np.int16) >= 0
+                bid = npz["basin_id"].astype(np.int16)
+                mask = bid >= 0
+                if bid.shape == shape:
+                    basin = np.where(bid >= 0, bid + 1, 0).astype(np.uint8)
     if mask is None:
-        mask = np.isfinite(annual)
-    if mask.shape != annual.shape:
-        raise SystemExit(f"basin_mask 形状 {mask.shape} 与 sst_annual 不符")
-    # 陆地与内陆湖统一为 NaN，浏览器里直接画灰色
-    annual = np.where(mask, annual, np.nan).astype(np.float32)
-    return lat, lon, annual, mask
+        mask = np.isfinite(fields["annual"])
+        basin = np.where(mask, 1, 0).astype(np.uint8)
+    if mask.shape != shape:
+        raise SystemExit(f"basin_mask 形状 {mask.shape} 与 sst 不符")
+
+    quantized: dict[str, np.ndarray] = {}
+    originals: dict[str, np.ndarray] = {}
+    for key, arr in fields.items():
+        masked_arr = np.where(mask, arr, np.nan).astype(np.float32)
+        originals[key] = masked_arr
+        q = np.full(shape, -32768, dtype=np.int16)
+        valid = mask & np.isfinite(arr)
+        q[valid] = np.clip(np.rint(arr[valid] * 100.0), -32767, 32767).astype(np.int16)
+        quantized[key] = q
+    return lat, lon, quantized, mask, basin, originals
 
 
-def build_contours(lon: np.ndarray, lat: np.ndarray, annual: np.ndarray) -> list[list[list[float]]]:
-    cg = contour_generator(x=lon, y=lat, z=np.ma.masked_invalid(annual), name="serial")
-    lines = cg.lines(ISOTHERM)
+def b64_int16(arr: np.ndarray) -> str:
+    return base64.b64encode(arr.astype("<i2", copy=False).tobytes(order="C")).decode("ascii")
+
+
+def build_contours(lon: np.ndarray, lat: np.ndarray, q: np.ndarray) -> list[list[list[float]]]:
+    z = q.astype(np.float32) / 100.0
+    z[q == -32768] = np.nan
+    cg = contour_generator(x=lon, y=lat, z=np.ma.masked_invalid(z), name="serial")
     segments: list[list[list[float]]] = []
-    for line in lines:
+    for line in cg.lines(ISOTHERM):
         arr = np.asarray(line, dtype=float)
         if len(arr) >= 2:
             segments.append(np.round(arr, 3).tolist())
     return segments
 
 
+def all_labels() -> list[dict]:
+    out: list[dict] = []
+    for name, lon, lat, tier, kind in OCEAN_LABELS:
+        out.append({"name": name, "lon": lon, "lat": lat, "tier": tier, "kind": kind})
+    for name, lon, lat, kind in SEA_LABELS_T2:
+        out.append({"name": name, "lon": lon, "lat": lat, "tier": 2, "kind": kind})
+    for name, lon, lat in SEA_LABELS_T3:
+        out.append({"name": name, "lon": lon, "lat": lat, "tier": 3, "kind": "sea"})
+    for name, lon, lat, kind in CURRENT_LABELS:
+        out.append({"name": name, "lon": lon, "lat": lat, "tier": 2, "kind": kind})
+    return out
+
+
 def make_html(
     lat: np.ndarray,
     lon: np.ndarray,
-    annual: np.ndarray,
-    contours: list[list[list[float]]],
+    quantized: dict[str, np.ndarray],
+    basin: np.ndarray,
+    contours: dict[str, list[list[list[float]]]],
 ) -> str:
-    h, w = annual.shape
-    sst16 = annual.astype(np.float16)
-    sst_b64 = base64.b64encode(sst16.tobytes(order="C")).decode("ascii")
+    h, w = quantized["annual"].shape
     cmap = colormaps["RdYlBu_r"]
+    cmap_diff = colormaps["RdBu_r"]
     lut = (cmap(np.linspace(0.0, 1.0, 256))[:, :3] * 255.0).round().astype(np.uint8)
-    lut_b64 = base64.b64encode(lut.tobytes(order="C")).decode("ascii")
+    lut_diff = (cmap_diff(np.linspace(0.0, 1.0, 256))[:, :3] * 255.0).round().astype(np.uint8)
     meta = {
         "w": int(w),
         "h": int(h),
@@ -96,7 +143,9 @@ def make_html(
         "dlon": float(lon[1] - lon[0]),
         "vmin": VMIN,
         "vmax": VMAX,
+        "diffLimit": DIFF_LIMIT,
         "isotherm": ISOTHERM,
+        "basinNames": BASIN_NAMES,
     }
     template = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -106,46 +155,81 @@ def make_html(
 <title>全球 SST 交互地图（0.25°）</title>
 <style>
   html, body { height: 100%; margin: 0; background: #0b1220; overflow: hidden; }
-  #map { display: block; width: 100vw; height: 100vh; cursor: grab; background: #d9d9d9; }
+  #map { display: block; width: 100vw; height: 100vh; cursor: crosshair; background: #d9d9d9; }
   #map.dragging { cursor: grabbing; }
   #hud {
-    position: fixed; left: 14px; top: 14px; z-index: 10; max-width: 390px;
+    position: fixed; left: 14px; top: 14px; z-index: 10; max-width: 430px;
     padding: 12px 14px; border-radius: 10px; color: #eef4ff;
-    background: rgba(9, 18, 34, 0.86); border: 1px solid rgba(255,255,255,0.18);
+    background: rgba(9, 18, 34, 0.88); border: 1px solid rgba(255,255,255,0.18);
     font: 13px/1.55 "Microsoft YaHei", "PingFang SC", sans-serif;
     box-shadow: 0 8px 30px rgba(0,0,0,0.35); backdrop-filter: blur(4px);
   }
   #hud h1 { margin: 0 0 6px; font-size: 16px; font-weight: 600; }
   #hud .hint { color: #a9b8d6; font-size: 12px; }
-  #readout { margin: 8px 0 6px; padding: 6px 8px; border-radius: 6px;
-             background: rgba(255,255,255,0.08); font-variant-numeric: tabular-nums; }
+  .row { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+  button {
+    padding: 4px 9px; border-radius: 6px; border: 1px solid #4f6a9a;
+    background: rgba(30, 52, 88, 0.9); color: #dbe7ff; cursor: pointer; font: inherit;
+    font-size: 12px;
+  }
+  button:hover { background: #28508a; }
+  button.active { background: #1d4ed8; border-color: #8db7ff; color: #fff; }
+  #layerInfo { margin-top: 8px; color: #cfe0ff; font-size: 12px; }
   #legend { display: flex; align-items: center; gap: 6px; margin-top: 7px; font-size: 11px; color: #c8d6f2; }
   #bar { height: 10px; flex: 1; border-radius: 3px; border: 1px solid rgba(255,255,255,0.25); }
-  button {
-    margin-top: 8px; padding: 5px 12px; border-radius: 6px; border: 1px solid #6ea8ff;
-    background: #1d4ed8; color: #fff; cursor: pointer; font: inherit;
+  #inspect {
+    position: fixed; right: 14px; bottom: 52px; z-index: 10; width: 268px;
+    padding: 10px 12px; border-radius: 9px; color: #eef4ff;
+    background: rgba(9, 18, 34, 0.88); border: 1px solid rgba(255,255,255,0.18);
+    font: 12px/1.55 "Microsoft YaHei", "PingFang SC", sans-serif;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.35); font-variant-numeric: tabular-nums;
   }
-  button:hover { background: #2563eb; }
+  #inspect b { color: #9cc4ff; font-weight: 600; }
+  #inspect .cross { font-size: 18px; color: #ffd166; margin-right: 4px; vertical-align: -1px; }
   #badge { position: fixed; right: 14px; bottom: 12px; z-index: 10; color: #d8e4ff;
-           font: 12px/1.4 "Microsoft YaHei", sans-serif; text-align: right;
+           font: 11px/1.4 "Microsoft YaHei", sans-serif; text-align: right;
            text-shadow: 0 1px 4px rgba(0,0,0,0.8); }
+  .sep { color: #5f7599; margin: 0 4px; }
 </style>
 </head>
 <body>
 <canvas id="map"></canvas>
 <div id="hud">
-  <h1>全球年均 SST · 0.25° 交互地图</h1>
+  <h1>全球 SST 交互地图 · 0.25°</h1>
   <div class="hint">滚轮缩放（以鼠标为中心） · 拖动平移 · 双击放大 · 按钮重置</div>
-  <div id="readout">移动鼠标查看经纬度与 SST</div>
-  <div id="legend"><span>−2 °C</span><div id="bar"></div><span>32 °C</span></div>
-  <button id="reset">重置视图</button>
+  <div class="row" id="layers">
+    <button data-layer="annual" class="active">年均</button>
+    <button data-layer="jan">1 月</button>
+    <button data-layer="jul">7 月</button>
+    <button data-layer="diff">7 月−1 月</button>
+  </div>
+  <div class="row" id="jumps">
+    <button data-jump="114,14,22,14">南海</button>
+    <button data-jump="125,29,18,12">东海</button>
+    <button data-jump="18,36,45,20">地中海</button>
+    <button data-jump="270,25,35,20">墨西哥湾</button>
+    <button id="reset">重置视图</button>
+  </div>
+  <div id="layerInfo">当前图层：年均 SST</div>
+  <div id="legend"><span id="vmin">−2 °C</span><div id="bar"></div><span id="vmax">32 °C</span></div>
+</div>
+<div id="inspect">
+  <div><span class="cross">┼</span><b>鼠标读数</b></div>
+  <div id="ins-pos">经度 — · 纬度 —</div>
+  <div id="ins-basin">海盆 —</div>
+  <div id="ins-sst">年均 — · 1 月 — · 7 月 — · 温差 —</div>
 </div>
 <div id="badge">OISST v2.1 · 2016–2020 气候态<br>0.25°≈28 km，为数据分辨率上限</div>
 <script>
 const META = __META__;
-const SST_B64 = "__SST__";
+const ANNUAL_B64 = "__ANNUAL__";
+const JAN_B64 = "__JAN__";
+const JUL_B64 = "__JUL__";
+const BASIN_B64 = "__BASIN__";
 const LUT_B64 = "__LUT__";
+const LUT_DIFF_B64 = "__LUT_DIFF__";
 const CONTOURS = __CONTOURS__;
+const LABELS = __LABELS__;
 
 function b64ToU8(b64) {
   const bin = atob(b64);
@@ -153,45 +237,75 @@ function b64ToU8(b64) {
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
 }
-function halfToFloat(h) {
-  const s = (h & 0x8000) ? -1 : 1;
-  const e = (h >> 10) & 0x1f;
-  const f = h & 0x3ff;
-  if (e === 0) return s * Math.pow(2, -14) * (f / 1024);
-  if (e === 31) return f ? NaN : s * Infinity;
-  return s * Math.pow(2, e - 15) * (1 + f / 1024);
+function b64ToI16(b64) {
+  const u8 = b64ToU8(b64);
+  const dv = new DataView(u8.buffer);
+  const out = new Int16Array(u8.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = dv.getInt16(i * 2, true);
+  return out;
 }
 
-const SST_BYTES = b64ToU8(SST_B64);
-const sstDV = new DataView(SST_BYTES.buffer);
-const SST = new Float32Array(META.w * META.h);
-for (let i = 0; i < SST.length; i++) {
-  SST[i] = halfToFloat(sstDV.getUint16(i * 2, true));
-}
+const DATA = {
+  annual: b64ToI16(ANNUAL_B64),
+  jan: b64ToI16(JAN_B64),
+  jul: b64ToI16(JUL_B64),
+};
+const BASIN = b64ToU8(BASIN_B64);
 const LUT = b64ToU8(LUT_B64);
+const LUT_DIFF = b64ToU8(LUT_DIFF_B64);
 const LAND = [217, 217, 217];
+const LAYERS = {
+  annual: { label: "年均 SST", data: DATA.annual, vmin: META.vmin, vmax: META.vmax, lut: LUT, contour: "annual" },
+  jan: { label: "1 月 SST", data: DATA.jan, vmin: META.vmin, vmax: META.vmax, lut: LUT, contour: "jan" },
+  jul: { label: "7 月 SST", data: DATA.jul, vmin: META.vmin, vmax: META.vmax, lut: LUT, contour: "jul" },
+  diff: { label: "7 月−1 月温差", data: null, vmin: -META.diffLimit, vmax: META.diffLimit, lut: LUT_DIFF, contour: null },
+};
+let layer = "annual";
 
 const canvas = document.getElementById('map');
 const ctx = canvas.getContext('2d', { alpha: false });
-const readout = document.getElementById('readout');
 const bar = document.getElementById('bar');
+const vminEl = document.getElementById('vmin');
+const vmaxEl = document.getElementById('vmax');
+const layerInfo = document.getElementById('layerInfo');
 let view = { lonMin: 0, lonMax: 360, latMin: -90, latMax: 90 };
 let dragging = null;
+let cursor = null;
 let scheduled = false;
 
+function valueAt(idx) {
+  if (layer === "diff") {
+    const a = DATA.jan[idx], b = DATA.jul[idx];
+    if (a === -32768 || b === -32768) return NaN;
+    return (b - a) / 100;
+  }
+  const q = LAYERS[layer].data[idx];
+  return q === -32768 ? NaN : q / 100;
+}
+function valueOf(key, idx) {
+  const q = DATA[key][idx];
+  return q === -32768 ? NaN : q / 100;
+}
+function basinName(idx) {
+  return META.basinNames[BASIN[idx]] || "—";
+}
+
 function setLegend() {
+  const cfg = LAYERS[layer];
   const stops = [];
   for (let i = 0; i <= 12; i++) {
     const k = Math.round(i / 12 * 255) * 3;
-    stops.push(`rgb(${LUT[k]},${LUT[k + 1]},${LUT[k + 2]}) ${(i / 12 * 100).toFixed(1)}%`);
+    stops.push(`rgb(${cfg.lut[k]},${cfg.lut[k + 1]},${cfg.lut[k + 2]}) ${(i / 12 * 100).toFixed(1)}%`);
   }
   bar.style.background = `linear-gradient(to right, ${stops.join(',')})`;
+  vminEl.textContent = `${cfg.vmin > 0 ? '+' : ''}${cfg.vmin.toFixed(0)} °C`;
+  vmaxEl.textContent = `${cfg.vmax > 0 ? '+' : ''}${cfg.vmax.toFixed(0)} °C`;
+  layerInfo.textContent = `当前图层：${cfg.label}`;
 }
 
 function sizeCanvas() {
-  const dpr = 1;  // 逐像素重绘，保持性能；0.25° 原生数据本身已足够细
-  canvas.width = Math.max(320, Math.floor(window.innerWidth * dpr));
-  canvas.height = Math.max(240, Math.floor(window.innerHeight * dpr));
+  canvas.width = Math.max(320, Math.floor(window.innerWidth));
+  canvas.height = Math.max(240, Math.floor(window.innerHeight));
   scheduleDraw();
 }
 
@@ -211,6 +325,7 @@ function clampView(v) {
 }
 
 function draw() {
+  const cfg = LAYERS[layer];
   const w = canvas.width, h = canvas.height;
   const spanLon = view.lonMax - view.lonMin;
   const spanLat = view.latMax - view.latMin;
@@ -226,7 +341,7 @@ function draw() {
   }
   const img = ctx.createImageData(w, h);
   const d = img.data;
-  const scale = 255 / (META.vmax - META.vmin);
+  const scale = 255 / (cfg.vmax - cfg.vmin);
   for (let py = 0; py < h; py++) {
     const iy = rows[py];
     let o = py * w * 4;
@@ -242,14 +357,15 @@ function draw() {
       if (ix < 0 || ix >= META.w) {
         d[o] = LAND[0]; d[o + 1] = LAND[1]; d[o + 2] = LAND[2];
       } else {
-        const v = SST[rowBase + ix];
-        if (Number.isNaN(v)) {
+        const idx = rowBase + ix;
+        const v = valueAt(idx);
+        if (Number.isNaN(v) || DATA.annual[idx] === -32768) {
           d[o] = LAND[0]; d[o + 1] = LAND[1]; d[o + 2] = LAND[2];
         } else {
-          let t = (v - META.vmin) * scale;
+          let t = (v - cfg.vmin) * scale;
           t = Math.max(0, Math.min(255, Math.round(t)));
           const k = t * 3;
-          d[o] = LUT[k]; d[o + 1] = LUT[k + 1]; d[o + 2] = LUT[k + 2];
+          d[o] = cfg.lut[k]; d[o + 1] = cfg.lut[k + 1]; d[o + 2] = cfg.lut[k + 2];
         }
       }
       d[o + 3] = 255;
@@ -258,44 +374,83 @@ function draw() {
   }
   ctx.putImageData(img, 0, 0);
 
-  // 30° 经纬网
+  // 15°/30° 经纬网
   ctx.save();
-  ctx.strokeStyle = 'rgba(20,35,55,0.16)';
-  ctx.lineWidth = 1;
   ctx.beginPath();
-  for (let lon = 0; lon <= 360; lon += 30) {
+  for (let lon = 0; lon <= 360; lon += 15) {
     if (lon < view.lonMin || lon > view.lonMax) continue;
+    ctx.strokeStyle = (lon % 30 === 0) ? "rgba(20,35,55,0.20)" : "rgba(20,35,55,0.10)";
+    ctx.lineWidth = (lon % 30 === 0) ? 1.0 : 0.6;
     const x = lonToX(lon);
-    ctx.moveTo(x, latToY(view.latMax));
-    ctx.lineTo(x, latToY(view.latMin));
+    ctx.beginPath(); ctx.moveTo(x, latToY(view.latMax)); ctx.lineTo(x, latToY(view.latMin)); ctx.stroke();
   }
-  for (let lat = -90; lat <= 90; lat += 30) {
+  for (let lat = -90; lat <= 90; lat += 15) {
     if (lat < view.latMin || lat > view.latMax) continue;
+    ctx.strokeStyle = (lat % 30 === 0) ? "rgba(20,35,55,0.20)" : "rgba(20,35,55,0.10)";
+    ctx.lineWidth = (lat % 30 === 0) ? 1.0 : 0.6;
     const y = latToY(lat);
-    ctx.moveTo(lonToX(view.lonMin), y);
-    ctx.lineTo(lonToX(view.lonMax), y);
+    ctx.beginPath(); ctx.moveTo(lonToX(view.lonMin), y); ctx.lineTo(lonToX(view.lonMax), y); ctx.stroke();
   }
-  ctx.stroke();
   ctx.restore();
 
-  // 25 °C 等值线
-  ctx.save();
-  ctx.strokeStyle = 'rgba(0,0,0,0.88)';
-  ctx.lineWidth = 1.15;
-  ctx.beginPath();
-  for (const seg of CONTOURS) {
-    let started = false;
-    for (const p of seg) {
-      const lon = p[0], lat = p[1];
-      if (lon < view.lonMin - 1 || lon > view.lonMax + 1 || lat < view.latMin - 1 || lat > view.latMax + 1) {
-        started = false;
-        continue;
+  // 当前图层的 25 °C 等值线（温差图层无 25 °C 线）
+  if (cfg.contour && CONTOURS[cfg.contour]) {
+    ctx.save();
+    ctx.strokeStyle = "rgba(0,0,0,0.88)";
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    for (const seg of CONTOURS[cfg.contour]) {
+      let started = false;
+      for (const p of seg) {
+        const lon = p[0], lat = p[1];
+        if (lon < view.lonMin - 1 || lon > view.lonMax + 1 || lat < view.latMin - 1 || lat > view.latMax + 1) {
+          started = false;
+          continue;
+        }
+        const x = lonToX(lon), y = latToY(lat);
+        if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
       }
-      const x = lonToX(lon), y = latToY(lat);
-      if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
     }
+    ctx.stroke();
+    ctx.restore();
   }
-  ctx.stroke();
+
+  drawLabels();
+
+  // 十字定位线
+  if (cursor) {
+    ctx.save();
+    ctx.strokeStyle = "rgba(255,255,255,0.85)";
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(cursor.px, 0); ctx.lineTo(cursor.px, canvas.height);
+    ctx.moveTo(0, cursor.py); ctx.lineTo(canvas.width, cursor.py);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawLabels() {
+  const spanLon = view.lonMax - view.lonMin;
+  ctx.save();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  for (const lab of LABELS) {
+    if (lab.tier === 3 && spanLon >= 40) continue;
+    if (lab.lon < view.lonMin || lab.lon > view.lonMax || lab.lat < view.latMin || lab.lat > view.latMax) continue;
+    const x = lonToX(lab.lon), y = latToY(lab.lat);
+    let size = 12, weight = "normal", style = "normal", color = "#17202a";
+    if (lab.kind === "ocean") { size = 18; weight = "bold"; }
+    else if (lab.kind === "warm") { color = "#8B1A1A"; style = "italic"; }
+    else if (lab.kind === "cold") { color = "#123B6D"; style = "italic"; }
+    else if (lab.tier === 3) { size = 11; }
+    ctx.font = `${style} ${weight} ${size}px "Microsoft YaHei", "PingFang SC", sans-serif`;
+    ctx.lineWidth = 3.2;
+    ctx.strokeStyle = "rgba(255,255,255,0.92)";
+    ctx.strokeText(lab.name, x, y);
+    ctx.fillStyle = color;
+    ctx.fillText(lab.name, x, y);
+  }
   ctx.restore();
 }
 
@@ -348,17 +503,33 @@ function fmtLon(lon) {
 function fmtLat(lat) {
   return `${Math.abs(lat).toFixed(2)}°${lat >= 0 ? 'N' : 'S'}`;
 }
-function updateReadout(m) {
-  const lon = Math.max(META.lon0, Math.min(META.lon0 + (META.w - 1) * META.dlon, m.lon));
-  const lat = Math.max(META.lat0, Math.min(META.lat0 + (META.h - 1) * META.dlat, m.lat));
-  const ix = Math.floor((lon - META.lon0) / META.dlon + 1e-9);
-  const iy = Math.floor((lat - META.lat0) / META.dlat + 1e-9);
-  let text = `${fmtLon(lon)} · ${fmtLat(lat)}`;
-  if (ix >= 0 && ix < META.w && iy >= 0 && iy < META.h) {
-    const v = SST[iy * META.w + ix];
-    text += Number.isNaN(v) ? ' · 陆地/无数据' : ` · SST ${v.toFixed(2)} °C`;
+function fmtVal(v) {
+  return Number.isNaN(v) ? "—" : `${v.toFixed(2)} °C`;
+}
+
+function cellIndex(lon, lat) {
+  const x = Math.max(META.lon0, Math.min(META.lon0 + (META.w - 1) * META.dlon, lon));
+  const y = Math.max(META.lat0, Math.min(META.lat0 + (META.h - 1) * META.dlat, lat));
+  const ix = Math.floor((x - META.lon0) / META.dlon + 1e-9);
+  const iy = Math.floor((y - META.lat0) / META.dlat + 1e-9);
+  if (ix < 0 || ix >= META.w || iy < 0 || iy >= META.h) return -1;
+  return iy * META.w + ix;
+}
+
+function updateInspect(m) {
+  const idx = cellIndex(m.lon, m.lat);
+  document.getElementById('ins-pos').textContent = `${fmtLon(m.lon)} · ${fmtLat(m.lat)}`;
+  if (idx < 0) {
+    document.getElementById('ins-basin').textContent = "海盆 —";
+    document.getElementById('ins-sst').textContent = "年均 — · 1 月 — · 7 月 — · 温差 —";
+    return;
   }
-  readout.textContent = text;
+  const a = valueOf("annual", idx), j = valueOf("jan", idx), u = valueOf("jul", idx);
+  let diff = "—";
+  if (!Number.isNaN(j) && !Number.isNaN(u)) diff = `${(u - j).toFixed(2)} °C`;
+  document.getElementById('ins-basin').textContent = `海盆 ${basinName(idx)}`;
+  document.getElementById('ins-sst').textContent =
+    `年均 ${fmtVal(a)} · 1 月 ${fmtVal(j)} · 7 月 ${fmtVal(u)} · 温差 ${diff}`;
 }
 
 canvas.addEventListener('mousedown', (ev) => {
@@ -373,10 +544,13 @@ window.addEventListener('mousemove', (ev) => {
   if (dragging) {
     panByPixels(ev.clientX - dragging.x, ev.clientY - dragging.y);
     dragging = { x: ev.clientX, y: ev.clientY };
-  } else {
-    updateReadout(mouseLonLat(ev));
   }
+  const m = mouseLonLat(ev);
+  cursor = m;
+  updateInspect(m);
+  scheduleDraw();
 });
+canvas.addEventListener('mouseleave', () => { cursor = null; scheduleDraw(); });
 canvas.addEventListener('wheel', (ev) => {
   ev.preventDefault();
   const m = mouseLonLat(ev);
@@ -385,6 +559,24 @@ canvas.addEventListener('wheel', (ev) => {
 canvas.addEventListener('dblclick', (ev) => {
   const m = mouseLonLat(ev);
   zoomAt(m.px, m.py, 1.8);
+});
+document.querySelectorAll('#layers button').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    layer = btn.dataset.layer;
+    document.querySelectorAll('#layers button').forEach((b) => b.classList.toggle('active', b === btn));
+    setLegend();
+    scheduleDraw();
+  });
+});
+document.querySelectorAll('#jumps button').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const [lon, lat, lonSpan, latSpan] = btn.dataset.jump.split(',').map(Number);
+    view = clampView({
+      lonMin: lon - lonSpan / 2, lonMax: lon + lonSpan / 2,
+      latMin: lat - latSpan / 2, latMax: lat + latSpan / 2,
+    });
+    scheduleDraw();
+  });
 });
 document.getElementById('reset').addEventListener('click', () => {
   view = { lonMin: 0, lonMax: 360, latMin: -90, latMax: 90 };
@@ -400,31 +592,53 @@ sizeCanvas();
 """
     return (
         template.replace("__META__", json.dumps(meta, ensure_ascii=False))
-        .replace("__SST__", sst_b64)
-        .replace("__LUT__", lut_b64)
+        .replace("__ANNUAL__", b64_int16(quantized["annual"]))
+        .replace("__JAN__", b64_int16(quantized["jan"]))
+        .replace("__JUL__", b64_int16(quantized["jul"]))
+        .replace("__BASIN__", base64.b64encode(basin.astype(np.uint8).tobytes(order="C")).decode("ascii"))
+        .replace("__LUT__", base64.b64encode(lut.tobytes(order="C")).decode("ascii"))
+        .replace("__LUT_DIFF__", base64.b64encode(lut_diff.tobytes(order="C")).decode("ascii"))
         .replace("__CONTOURS__", json.dumps(contours, separators=(",", ":")))
+        .replace("__LABELS__", json.dumps(all_labels(), ensure_ascii=False, separators=(",", ":")))
     )
 
 
-def validate_embedded(sst_b64: str, lat: np.ndarray, lon: np.ndarray, annual: np.ndarray, mask: np.ndarray) -> None:
-    decoded = np.frombuffer(base64.b64decode(sst_b64), dtype="<f2").astype(np.float32).reshape(annual.shape)
+def _decode_embedded(html: str, token: str, shape: tuple[int, int]) -> np.ndarray:
+    m = re.search(rf'{token} = "([A-Za-z0-9+/=]+)"', html)
+    if m is None:
+        raise SystemExit(f"HTML 中找不到 {token}")
+    raw = base64.b64decode(m.group(1))
+    return np.frombuffer(raw, dtype="<i2").astype(np.float32).reshape(shape) / 100.0
+
+
+def validate(html: str, originals: dict[str, np.ndarray], basin: np.ndarray,
+             lat: np.ndarray, lon: np.ndarray) -> float:
+    shape = originals["annual"].shape
+    embedded = {key: _decode_embedded(html, f"{key.upper()}_B64", shape) for key in ("annual", "jan", "jul")}
     rng = np.random.default_rng(2024)
-    candidates = np.flatnonzero(mask & np.isfinite(annual))
-    picks = rng.choice(candidates, size=5, replace=False)
-    print("  内嵌 float16 随机抽 5 个海洋格点与原始 npz 对比：")
-    max_diff = 0.0
+    ocean = np.flatnonzero(
+        np.isfinite(originals["annual"]) & np.isfinite(originals["jan"]) & np.isfinite(originals["jul"])
+    )
+    picks = rng.choice(ocean, size=5, replace=False)
+    print("  内嵌 int16 随机抽 5 个海洋格点（embedded vs npz，容差 0.01 °C）：")
+    worst = 0.0
     for k in picks:
-        iy, ix = np.unravel_index(int(k), annual.shape)
-        a = float(annual[iy, ix])
-        b = float(decoded[iy, ix])
-        diff = abs(a - b)
-        max_diff = max(max_diff, diff)
+        iy, ix = np.unravel_index(int(k), shape)
+        vals = {key: float(embedded[key][iy, ix]) for key in ("annual", "jan", "jul")}
+        orig = {key: float(originals[key][iy, ix]) for key in ("annual", "jan", "jul")}
+        diffs = {key: abs(vals[key] - orig[key]) for key in vals}
+        worst = max(worst, max(diffs.values()))
         print(
-            f"    {fmt_lon(lon[ix])} {fmt_lat(lat[iy])}: npz={a:.3f} °C, embedded={b:.3f} °C, diff={diff:.4f}"
+            f"    {fmt_lon(lon[ix])} {fmt_lat(lat[iy])} ({BASIN_NAMES[int(basin[iy, ix])]}): "
+            f"annual {vals['annual']:.2f}/{orig['annual']:.2f}, "
+            f"jan {vals['jan']:.2f}/{orig['jan']:.2f}, "
+            f"jul {vals['jul']:.2f}/{orig['jul']:.2f}, "
+            f"maxdiff={max(diffs.values()):.4f}"
         )
-    if max_diff > 0.02:
-        raise SystemExit(f"内嵌 float16 与 npz 最大差异 {max_diff:.4f} °C > 0.02 °C")
-    print(f"  最大差异 {max_diff:.4f} °C（float16 量化容差 0.02 °C）")
+    if worst > 0.01:
+        raise SystemExit(f"内嵌 int16 与 npz 原始值最大差异 {worst:.4f} °C > 0.01 °C")
+    print(f"  最大偏差 {worst:.4f} °C（int16×100 量化上限 0.005 °C）")
+    return worst
 
 
 def fmt_lon(lon: float) -> str:
@@ -443,26 +657,26 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     args = parser.parse_args()
 
-    lat, lon, annual, mask = load_annual(args.grid, args.mask)
-    print(f"读取 {args.grid}：{annual.shape[1]}×{annual.shape[0]} 网格，海洋格点 {int(mask.sum())}")
-    contours = build_contours(lon, lat, annual)
-    print(f"25 °C 等值线：{len(contours)} 段，{sum(len(s) for s in contours)} 个点")
-    html = make_html(lat, lon, annual, contours)
-
-    # 重新截取 base64 做校验（与写入 HTML 的数据一致）
-    sst_b64 = base64.b64encode(annual.astype(np.float16).tobytes(order="C")).decode("ascii")
-    validate_embedded(sst_b64, lat, lon, annual, mask)
+    lat, lon, quantized, mask, basin, originals = load_layers(args.grid, args.mask)
+    print(f"读取 {args.grid}：{quantized['annual'].shape[1]}×{quantized['annual'].shape[0]} 网格，"
+          f"海洋格点 {int(mask.sum())}")
+    contours = {key: build_contours(lon, lat, q) for key, q in quantized.items()}
+    print("25 °C 等值线：" + "，".join(f"{key}={len(seg)} 段" for key, seg in contours.items()))
+    html = make_html(lat, lon, quantized, basin, contours)
+    worst = validate(html, originals, basin, lat, lon)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(html, encoding="utf-8")
     size = args.out.stat().st_size
     print(f"已生成 {args.out}：{size / 1e6:.2f} MB")
-    print(f"  float16 base64 长度：{len(sst_b64):,} 字符（原始 {annual.size * 2:,} 字节）")
-    if "__SST__" in html or "__META__" in html or "__CONTOURS__" in html:
+    for key in ("annual", "jan", "jul"):
+        b64_len = len(b64_int16(quantized[key]))
+        print(f"  {key} int16 base64 长度：{b64_len:,} 字符（原始 {quantized[key].size * 2:,} 字节）")
+    if "__ANNUAL__" in html or "__META__" in html or "__CONTOURS__" in html:
         raise SystemExit("HTML 模板占位符未替换")
     if size >= MAX_BYTES:
         raise SystemExit(f"HTML 体积 {size / 1e6:.1f} MB ≥ 12 MB")
-    print(f"  校验通过：文件 < 12 MB，交互为原生 canvas，无外部请求。")
+    print(f"  校验通过：文件 < 12 MB，无外部请求，量化最大偏差 {worst:.4f} °C。")
     return 0
 
 
