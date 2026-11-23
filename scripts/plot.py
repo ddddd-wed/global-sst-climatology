@@ -1426,9 +1426,12 @@ def plot_warming_trend(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Pat
     for item, color in ((warm, "#C0392B"), (cold, "#2E6DB4")):
         i = int(np.argmin(np.abs(years - item["year"])))
         ax1.plot(years[i], y[i], "o", ms=8, mfc=color, mec="white", mew=1.2, zorder=5)
+        right_edge = years[i] > years.mean()
         ax1.annotate(f"{item['year']}：{item['global_mean_sst_c']:.2f} °C",
-                     xy=(years[i], y[i]), xytext=(8, 14 if color == "#C0392B" else -18),
+                     xy=(years[i], y[i]),
+                     xytext=(-8 if right_edge else 8, 14 if color == "#C0392B" else -18),
                      textcoords="offset points", fontsize=10, color=color,
+                     ha="right" if right_edge else "left",
                      bbox={"boxstyle": "round,pad=0.25", "fc": "white", "ec": color, "alpha": 0.9})
     ax1.set_xlim(years.min() - 0.5, years.max() + 0.5)
     ax1.set_xticks(np.arange(1982, 2026, 4))
