@@ -16,3 +16,6 @@ figures/*.png.tmp
 .mplconfig/
 .uv-cache/
 .tmp/
+
+# analysis side: generated verification report (not committed)
+data/verify_report.json
