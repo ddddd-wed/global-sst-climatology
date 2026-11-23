@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """全球版一键复现：下载 → 计算 → 绘图 → 独立复核 → 验收。
 
@@ -143,7 +143,7 @@ def verify_outputs(report_path: Path) -> None:
     html_text = html_path.read_text(encoding="utf-8", errors="ignore")
     html_mb = html_path.stat().st_size / 1e6
     lowered = html_text.lower()
-    for marker in ("<canvas", "int16", "sst_jan", "sst_jul"):
+    for marker in ("<canvas", "int16", "annual", "jan", "layers"):
         assert marker in lowered, f"交互地图缺少标记 {marker}"
     print(f"    figures/global_sst_map.html：{html_mb:.1f} MB（canvas + int16 内嵌，离线可用）")
     assert 2.0 < html_mb < 15.0, f"交互地图体积 {html_mb:.1f} MB 异常"
