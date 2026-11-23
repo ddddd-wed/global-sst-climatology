@@ -171,6 +171,10 @@ def load_ocean_mask(data_dir: Path) -> tuple[np.ndarray | None, str]:
                     mask = npz["basin_mask"].astype(np.uint8) > 0
                     if mask.shape == (N_LAT_GLOBAL, N_LON_GLOBAL):
                         return mask, f"{name}::basin_mask"
+                if "basin_id" in npz.files:
+                    mask = npz["basin_id"].astype(np.int16) >= 0
+                    if mask.shape == (N_LAT_GLOBAL, N_LON_GLOBAL):
+                        return mask, f"{name}::basin_id"
         except Exception:  # noqa: BLE001
             continue
     return None, "none"

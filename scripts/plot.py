@@ -492,7 +492,8 @@ def plot_global_profile(ctx: dict, cov_min: float) -> Path:
         0.005,
         "注：纬向平均为同一纬度圈内有效海洋格点（非陆地/海冰）的算术平均，未乘 cosφ；\n"
         f"海洋占比 zonal_ocean_frac = 有效格点数 / {N_LON_GLOBAL}，曲线只画 ≥ {cov_min:.0%} 的纬度；"
-        "有数据比例 coverage = 有效格点数 / ocean_grid_count（非海冰/非缺测），仅用于副图展示。",
+        "有数据比例 coverage = 有效格点数 / ocean_grid_count（非海冰/非缺测），仅用于副图展示。\n"
+        "里海、北美五大湖按内陆水体剔除（basin_mask=0），不算海洋格点；45–50°N 的海洋占比因此偏低。",
         fontsize=8.3,
         color="0.35",
         va="bottom",
@@ -663,7 +664,7 @@ def plot_map(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
         0.01,
         0.005,
         "注：未引入 cartopy，采用等经纬（Plate Carrée）投影的 pcolormesh；"
-        f"色标固定 −2～32 °C；{boundary_note}。",
+        f"色标固定 −2～32 °C；{boundary_note}；里海、北美五大湖按内陆水体剔除（basin_mask=0）。",
         fontsize=8.4,
         color="0.35",
         va="bottom",

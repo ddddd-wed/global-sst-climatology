@@ -164,9 +164,9 @@
 
 | 文件 | 像素 | 体积 |
 | --- | --- | --- |
-| `global_sst_vs_latitude.png` | 2404 × 1457 | 364 KB |
+| `global_sst_vs_latitude.png` | 2404 × 1457 | 378 KB |
 | `basins_sst_vs_latitude.png` | 3227 × 1421 | 417 KB |
-| `global_sst_map.png` | 2376 × 1187 | 293 KB |
+| `global_sst_map.png` | 2376 × 1187 | 300 KB |
 | `lat_month_heatmap.png` | 2482 × 1318 | 220 KB |
 | `indian_vs_global.png` | 2364 × 1630 | 249 KB |
 
@@ -179,8 +179,10 @@
 1. **数值复算**：读取 `data/raw/`（或 `--raw-dir`）的 60 个 `csv.gz`，独立重算「逐时次纬向平均 →
    同月多年平均 → 12 月等权年均」，抽 **8 个纬度（-70/-45/-20/0/20/40/60/75°）× 1 月、7 月** 与
    `zonal_mean_basins.csv` 的 `global` 行按纬度对齐，容差 **0.01 °C**；年均同纬度一并比对。
-   统计域用 `basin_mask.npz::basin_mask`（剔除内陆湖泊，否则里海等封闭水域会让 45°N 的纬向平均偏 0.3 °C），
-   **SST 均值本身仍由 `verify.py` 从 raw 独立计算**；月度列缺失时自动只比年均。
+   统计域用 `basin_mask.npz::basin_mask`（或 `basin_id`）剔除**里海（719 格）与北美五大湖（531 格）**
+   等内陆水体，否则 45–50°N 的纬向平均会系统性偏高 0.3 °C 左右。raw 文件里仍有这些水体的原始温度，
+   是**按掩膜排除**、不是数据缺失；**SST 均值本身仍由 `verify.py` 从 raw 独立计算**。
+   月度列缺失时自动只比年均。
 2. **结构性检查**：720 行、0.25° 步长、纬度单调；新增列自洽——
    `coverage ≈ valid_count / ocean_grid_count`、`zonal_ocean_frac ≈ valid_count / 1440`、
    `cov_MM` 与 `sst_MM` 同 NaN 模式（均容差 **0.002**）；海洋值不超出 −2～35 °C、
@@ -213,8 +215,8 @@ fixture 自测：`verify.py --data-dir .tmp/fixture --skip-online` →
 `pass_with_skips（通过 4 / 失败 0 / 跳过 2）`，退出码 0；结构性检查覆盖
 `coverage = valid/ocean_grid_count`、`zonal_ocean_frac = valid/1440`、`cov_MM`/`sst_MM` NaN 模式、
 按纬度对齐的 basins 行对齐与缺失行断言。
-单元测试 14 项（等温线双交点、印度洋回归、raw 重算往返、60 时次全流程、覆盖率/海洋占比/NaN 模式
-自洽与破坏检测、basins 缺行断言、无月度键网格）全部通过。
+单元测试 15 项（等温线双交点、印度洋回归、raw 重算往返/掩膜剔除、60 时次全流程、
+覆盖率/海洋占比/NaN 模式自洽与破坏检测、basins 缺行断言、无月度键网格）全部通过。
 
 ## 8. 关键结果（待真实数据填入）
 
@@ -229,6 +231,9 @@ fixture 自测：`verify.py --data-dir .tmp/fixture --skip-online` →
 
 ## 9. 已知局限
 
+- **内陆水体按掩膜剔除**：里海（719 格）与北美五大湖（531 格）在 `basin_mask` 中为 0（陆地），
+  raw 中虽有非 NaN 温度但不参与纬向平均；因此 45–50°N 的 `zonal_ocean_frac` 会比不剔除时低，
+  这是正确口径，不是异常。
 - **10% 海洋占比阈值与极地海冰**：北冰洋冬季、南大洋高纬在 60 个时次平均后有效海洋格点可能低于 10%，
   这些纬度不绘制；阈值附近结果对阈值敏感。注意这里用的是 `zonal_ocean_frac = valid_count/1440`，
   不是 `coverage`（有数据比例）。

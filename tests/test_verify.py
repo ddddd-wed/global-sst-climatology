@@ -100,6 +100,21 @@ class TestRawRecompute(unittest.TestCase):
         np.testing.assert_allclose(counts[0], np.full(4, 4.0))
         self.assertEqual(counts.shape, (12, 4))
 
+    def test_mask_excludes_non_ocean_cells(self) -> None:
+        """basin_mask=0 的格点（如里海/五大湖）必须从 raw 纬向平均中剔除。"""
+        lats = np.array([-0.375, -0.125, 0.125, 0.375])
+        lons = np.array([0.125, 0.375, 0.625, 0.875])
+        raw_dir = scratch_dir("mask_raw") / "raw"
+        raw_dir.mkdir()
+        _write_tiny_raw(raw_dir, lats, lons)
+        mask = np.zeros((4, 4), dtype=bool)
+        mask[:, :2] = True  # 只保留前两个经度格点
+        files = verify.list_raw_files(raw_dir)
+        _, clim, annual, counts = verify.recompute_zonal_from_raw(files, ocean_mask=mask)
+        np.testing.assert_allclose(clim[0], np.full(4, 1.05), atol=1e-12)
+        np.testing.assert_allclose(annual, np.full(4, 6.55), atol=1e-12)
+        np.testing.assert_allclose(counts[0], np.full(4, 2.0))
+
     def test_full_60_timestep_check_passes(self) -> None:
         """用 60 个「720 纬圈 × 1 经度」的小文件跑通 check_raw_recompute 全流程。"""
         lats = np.round(verify.LAT_FIRST + verify.LAT_STEP * np.arange(verify.N_LAT_GLOBAL), 3)
