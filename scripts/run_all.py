@@ -10,8 +10,8 @@
     python scripts/run_all.py --raw-dir <缓存目录> --skip-download
     python scripts/run_all.py --jobs 8
 
-任一步骤非零退出立即停止。验收口径为全球版：720 行 × 32 列、6 个海盆、720×1440 网格、
-8 张正式静态图、summary 字段与 verify.py 6 项无失败（ERDDAP 在线抽样不可用时可跳过并打印说明）；
+任一步骤非零退出立即停止。验收口径为全球版：720 行 × 55 列、6 个海盆、720×1440 网格、
+8 张正式静态图、summary 字段与 verify.py 9 项无失败（ERDDAP 在线抽样/海冰 raw 不可用时可跳过并打印说明）；
 并打印旧印度洋回归三项数值。
 """
 
@@ -73,6 +73,20 @@ INDIAN_BASELINE = {
 }
 
 
+def resolve_ice_dir(explicit: Path | None) -> Path | None:
+    """显式 --ice-raw-dir 优先；否则找 data/raw_global_ice 或同盘数据仓库相邻目录。"""
+    candidates = [
+        explicit,
+        ROOT / "data" / "raw_global_ice",
+        ROOT.parent / "global-sst-v2-data" / "data" / "raw_global_ice",
+    ]
+    for path in candidates:
+        if path is not None and path.exists():
+            return path.resolve()
+    return None
+
+
+
 def run_step(title: str, script: str, extra: list[str] | None = None) -> float:
     print("\n" + "=" * 78, flush=True)
     print(f"▶ {title}  ({script})", flush=True)
@@ -108,8 +122,11 @@ def verify_outputs(report_path: Path) -> None:
     # [1] 全球纬向平均 CSV
     df = pd.read_csv(GLOBAL_ZONAL_CSV)
     print(f"[1] {GLOBAL_ZONAL_CSV.name}：{df.shape[0]} 行 × {df.shape[1]} 列")
-    assert df.shape == (720, 32), f"形状 {df.shape} != (720, 32)"
+    assert df.shape == (720, 55), f"形状 {df.shape} != (720, 55)"
     assert list(df.columns[:7]) == FIRST7_COLUMNS, f"前 7 列异常：{list(df.columns[:7])}"
+    for col in ("sst_annual_icefree", "ice_frac", "sst_p10", "sst_p90",
+                "sst_interannual_std", "sst_warmest", "sst_coldest", "seasonal_amp"):
+        assert col in df.columns, f"缺少新列 {col}"
     print(f"    前 7 列：{', '.join(FIRST7_COLUMNS)}")
 
     # [2] 分海盆 CSV
@@ -117,6 +134,7 @@ def verify_outputs(report_path: Path) -> None:
     names = set(basins["basin"].astype(str).str.strip().str.lower())
     print(f"[2] {BASINS_ZONAL_CSV.name}：{len(basins)} 行，海盆 {sorted(names)}")
     assert names == BASIN_NAMES, f"海盆集合异常：{names} != {BASIN_NAMES}"
+    assert basins.shape[1] == 55, f"分海盆列数 {basins.shape[1]} != 55"
 
     # [3] 气候态网格
     with np.load(CLIMATOLOGY_NPZ) as npz:
@@ -148,7 +166,7 @@ def verify_outputs(report_path: Path) -> None:
     for marker in ("<canvas", "int16", "annual", "jan", "layers"):
         assert marker in lowered, f"交互地图缺少标记 {marker}"
     print(f"    figures/global_sst_map.html：{html_mb:.1f} MB（canvas + int16 内嵌，离线可用）")
-    assert 2.0 < html_mb < 15.0, f"交互地图体积 {html_mb:.1f} MB 异常"
+    assert 2.0 < html_mb < 5.0, f"交互地图体积 {html_mb:.1f} MB 异常（gzip 后应 <3 MB）"
 
     # [5] summary_metrics
     summary = json.loads(SUMMARY_JSON.read_text(encoding="utf-8"))
@@ -156,12 +174,12 @@ def verify_outputs(report_path: Path) -> None:
     print(f"[5] {SUMMARY_JSON.name}：basins.global.mean_sst_cos_weighted = {value}")
     assert isinstance(value, (int, float)) and np.isfinite(value), "summary 均温字段异常"
 
-    # [6] verify 报告：6 项无失败（ERDDAP 在线抽样不可用时允许 skip，但必须打印说明）
+    # [6] verify 报告：9 项无失败（在线抽样/海冰 raw 不可用时允许 skip）
     report = json.loads(report_path.read_text(encoding="utf-8"))
     counts = report["counts"]
     print(f"[6] verify.py：pass={counts['pass']} fail={counts['fail']} skip={counts['skip']}")
     assert counts["fail"] == 0, f"verify 存在失败项：{counts}"
-    assert counts["pass"] + counts["skip"] == 6, f"verify 检查项数异常：{counts}"
+    assert counts["pass"] + counts["skip"] == 9, f"verify 检查项数异常：{counts}"
     if counts["skip"]:
         skipped = "、".join(c["name"] for c in report["checks"] if c["status"] == "skip")
         print(f"    注意：{counts['skip']} 项被跳过（{skipped}），无失败项，视为通过。")
@@ -187,6 +205,8 @@ def main() -> int:
     group.add_argument("--force-download", action="store_true", help="忽略已有缓存重新下载")
     group.add_argument("--skip-download", action="store_true", help="跳过下载，直接用现有 raw 缓存")
     parser.add_argument("--raw-dir", type=Path, default=GLOBAL_RAW_DIR, help="raw 缓存目录（默认 data/raw_global）")
+    parser.add_argument("--ice-raw-dir", type=Path, default=None,
+                        help="海冰 raw 目录（默认 data/raw_global_ice；不存在则 verify SKIP）")
     parser.add_argument("--jobs", type=int, default=4, help="下载并发数（默认 4）")
     args = parser.parse_args()
 
@@ -200,6 +220,8 @@ def main() -> int:
     print(f"Python {sys.version.split()[0]}  {sys.executable}")
     print(f"项目根目录：{ROOT}")
     print(f"raw 缓存：{raw_dir}")
+    ice_dir = resolve_ice_dir(args.ice_raw_dir)
+    print(f"海冰 raw：{ice_dir if ice_dir is not None else '未找到（verify 将 SKIP；compute 需要海冰数据）'}")
 
     timings: dict[str, float] = {}
     total0 = time.time()
@@ -216,14 +238,16 @@ def main() -> int:
     timings["计算"] = run_step(
         "计算全球纬向平均、五大洋与网格产物",
         "compute.py",
-        ["--region", "global", "--raw-dir", str(raw_dir)],
+        ["--region", "global", "--raw-dir", str(raw_dir)]
+        + (["--ice-dir", str(ice_dir)] if ice_dir else []),
     )
     timings["绘图"] = run_step("绘制 8 张正式图", "plot.py")
     timings["交互图"] = run_step("生成可缩放交互地图（HTML）", "make_map_viewer.py")
     timings["复核"] = run_step(
-        "独立复核（60 时次 raw + ERDDAP 在线抽样）",
+        "独立复核（60 时次 raw + 无冰 raw + ERDDAP 在线抽样）",
         "verify.py",
-        ["--raw-dir", str(raw_dir), "--report", str(VERIFY_REPORT)],
+        ["--raw-dir", str(raw_dir), "--report", str(VERIFY_REPORT)]
+        + (["--ice-raw-dir", str(ice_dir)] if ice_dir else []),
     )
 
     verify_outputs(VERIFY_REPORT)

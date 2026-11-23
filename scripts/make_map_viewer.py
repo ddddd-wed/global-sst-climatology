@@ -140,14 +140,15 @@ def load_anomaly(
         if "sst_annual_anom" not in npz.files:
             raise SystemExit(f"{anom_path} 缺少 sst_annual_anom")
         anom = npz["sst_annual_anom"].astype(np.float32)
+        base = npz["sst_annual_icefree"].astype(np.float32) if "sst_annual_icefree" in npz.files else annual
     if anom.shape != annual.shape:
         raise SystemExit(f"anomaly_grid 形状 {anom.shape} != {annual.shape}")
-    expected = annual - ref[:, None]
+    expected = base - ref[:, None]
     ok = np.isfinite(expected) & np.isfinite(anom)
     max_diff = float(np.max(np.abs(expected[ok] - anom[ok]))) if ok.any() else float("nan")
     if not np.isfinite(max_diff) or max_diff > 0.01:
         raise SystemExit(f"anomaly_grid 与 zonal_ref 不一致：maxdiff={max_diff:.4f} °C > 0.01")
-    print(f"  权威异常场校验通过：{anom_path.name} vs ref，最大差 {max_diff:.4f} °C")
+    print(f"  权威异常场校验通过：{anom_path.name} vs ref（icefree−ref），最大差 {max_diff:.4f} °C")
     return _quantize(anom, mask), anom
 
 

@@ -6,9 +6,9 @@
 并提供一套**不依赖 `compute.py`** 的独立复核脚本。旧的印度洋（20°E–120°E、40°S–30°N）结果原样保留在
 [附录](#附录印度洋旧结果20162020)中，作为回归基准。
 
-> **当前状态**：数据侧全球结果已合入 master（fe3a68b，720×32 / 2215×32 / 5.0 MB npz 等全部入库），
+> **当前状态**：数据侧 Wave 1 已合入 master（`0f784b3`，720×55 / 2215×55 双口径 CSV、11 MB anomaly_grid、zonal_ref 等入库），
 > 本分支已 rebase 到该提交；`figures/` 下 8 张正式静态图 + 1 个交互 HTML 与下方关键结果均由这批真实数据产出，
-> `scripts/verify.py` 的完整复核（60 时次 raw 重算 + ERDDAP 在线抽样）6 项全部 PASS。
+> `scripts/verify.py` 的完整复核（60 时次 raw 重算 + 无冰 raw + 异常场 + 统计列 + ERDDAP 在线抽样）9 项全部 PASS。
 
 ![全球 SST–纬度廓线](figures/global_sst_vs_latitude.png)
 
@@ -147,30 +147,29 @@
 
 # 强制重下 / 调整并发 / 自定义 raw 缓存目录
 .venv\Scripts\python.exe scripts\run_all.py --force-download --jobs 8
-.venv\Scripts\python.exe scripts\run_all.py --raw-dir <raw_global 目录> --skip-download
+.venv\Scripts\python.exe scripts\run_all.py --raw-dir <raw_global 目录> --skip-download --ice-raw-dir <raw_global_ice 目录>
 ```
 
-- `run_all.py` 任一步非零立即停止；最后验收：`zonal_mean_global.csv` 720×32（前 7 列契约）、
+- `run_all.py` 任一步非零立即停止；最后验收：`zonal_mean_global.csv` 720×55（前 7 列契约）、
   `zonal_mean_basins.csv` 6 个海盆、`climatology_grid.npz` 720×1440（约 5 MB）、8 张正式图
   PNG 合法且 >100 KB、`summary_metrics.json` 含 `basins.global.mean_sst_cos_weighted`、
-  `verify.py` **6 项无失败**（在线抽样网络不可用时可 SKIP），并打印旧印度洋回归三项数值。
-- **耗时**（本机实测，raw 已缓存）：下载校验 **2.6 s**、计算 **15.9 s**、绘图 **8.1 s**、
-  复核 **22.8 s**、总计 **51.3 s**（本机 51.9 s 墙钟）。冷启动联网下载参考约 **139 s**（数据侧实测），
-  计算约 **13 s**、复核约 **21 s**；绘图在数据侧参考约 **1–2 min**，本机实测 8.1 s
-  （含 4K 地图、Mollweide、异常图、6 宫格放大图、中文标注与 HTML；首次字体缓存/较慢机器会更久）。
+  `verify.py` **9 项无失败**（海冰 raw/在线抽样不可用时相应 SKIP），并打印旧印度洋回归三项数值。
+- **耗时**（本机 `python scripts/run_all.py` 默认实测）：下载校验 **2.6 s**、计算 **27.1 s**、绘图 **8.1 s**、
+  复核 **41.2 s**（在线 503 时 1 项 SKIP）、总计 **81.1 s**（本机 81.8 s 墙钟）。海冰 raw 自动探测
+  `../global-sst-v2-data/data/raw_global_ice`；首次字体缓存/较慢机器会更久。
 - **交互地图**：`scripts/make_map_viewer.py` 读取 `climatology_grid.npz` / `basin_mask.npz`，
   把 `sst_annual` / `sst_jan` / `sst_jul` 转成 int16×100 差分 + gzip + base64 内嵌到
-  `figures/global_sst_map.html`（约 2.10 MB），五个图层（年均/1月/7月/7月−1月/同纬度异常）实时切换，
+  `figures/global_sst_map.html`（约 2.66 MB），五个图层（年均/1月/7月/7月−1月/同纬度异常）实时切换，
   浏览器本地 canvas 重绘；滚轮缩放/拖动/双击放大/重置、Shift 框选统计、URL hash 深链，无需网络。
 - **T5/T6 新列消费（自动降级）**：`plot.py` 检测
   `sst_*_icefree`（无冰）、`sst_p10/p90`（空间离散）、`sst_interannual_std`（5 年年际）、
   `sst_warmest/coldest`（真实最暖/最冷月）、`ice_frac`（海冰斜纹）等列；
   缺列时打印「数据侧列未就绪，已跳过 X」并保持旧图，不报错。若 `data/anomaly_grid.npz`
   存在则优先使用并与 `data/zonal_ref.csv` 交叉校验（容差 0.01 °C），否则用本地
-  `sst_annual − 同纬度平均`；HTML 第五层同样优先使用权威异常场。
-- **T5/T6 自测**：用 fixture 伪造全部 23 个新列跑通全球廓线；真实数据缺列时只打印
-  「已跳过 23 列」并正常出 8 张图；伪造 `anomaly_grid.npz` 与 `zonal_ref.csv` 时
-  权威异常场校验通过，HTML 增加到 2.61 MB（仍 <3 MB）。
+  `sst_annual_icefree − 同纬度无冰平均`；HTML 第五层同样优先使用权威异常场。
+- **T5/T6 自测**：fixture 伪造全部 23 个新列跑通全球廓线；真实数据到位后自动启用
+  无冰/P10–P90/年际/最暖最冷月/海冰斜纹，`anomaly_grid.npz` 与 `zonal_ref.csv`
+  校验残差 **1.37e-06 °C**；HTML 内嵌权威异常层后 **2.66 MB**（仍 <3 MB）。
 - **缓存目录**：全球 raw 在 `data/raw_global/`（60 个 `sst_YYYY_MM.csv.gz`，约 252 MB），
   已由 `.gitignore` 忽略、不入库；旧的印度洋缓存是 `data/raw/`，只服务印度洋回归、不参与全球数值复核。
   `--raw-dir` 只影响 compute/verify；`fetch_data.py` 只写默认缓存，自定义目录时请配 `--skip-download`。
@@ -180,7 +179,7 @@
   .venv\Scripts\python.exe scripts\compute.py --region global --raw-dir data\raw_global
   .venv\Scripts\python.exe scripts\plot.py
   .venv\Scripts\python.exe scripts\make_map_viewer.py   # 生成 figures/global_sst_map.html
-  .venv\Scripts\python.exe scripts\verify.py --raw-dir data\raw_global --report .tmp\verify_report_final.json
+  .venv\Scripts\python.exe scripts\verify.py --raw-dir data\raw_global --ice-raw-dir data\raw_global_ice --report .tmp\verify_report_final.json
   .venv\Scripts\python.exe scripts\verify.py --skip-online   # 不联网
   ```
 
@@ -209,7 +208,7 @@
 | `global_sst_map.png` | **5760×2880（4K）** 0.25° 全球年均 SST 等经纬（Plate Carrée）地图；15°/30° 经纬网、0/10/15/20/25/28 °C 六档等值线（25 加粗并标注）、中文海区/洋流/五大洋标注、内陆湖灰色。**未引入 cartopy** |
 | `global_sst_map_regions.png` | 6 个重点海域 2×3 放大图（东亚、珊瑚三角、印度洋北部、地中海/黑海、加勒比/墨西哥湾、西太平洋暖池），0.25° 原生、统一色标、15/20/25/28 °C 等值线、中文海区/洋流标注、经纬网与海岸线；距子图边缘 <2.5° 的标注自动隐藏，避免裁字 |
 | `global_sst_map_mollweide.png` | **4800×2400** Mollweide 等面积投影（lon 转 −180…180），陆灰、25 °C 等值线、色标 −2～32 °C；用于面积对比，与等经纬 4K 图并存、不替换 |
-| `global_sst_anomaly.png` | **5760×2880** 同纬度异常 = 年均 SST − 该纬度有效海洋格点算术平均；优先 `anomaly_grid.npz`（与 `zonal_ref.csv` 校验 ≤0.01 °C），缺失时本地算；`RdBu_r` 对称 ±8 °C（超出截断），0 线加粗。**不是相对时间平均** |
+| `global_sst_anomaly.png` | **5760×2880** 同纬度异常 = 无冰年均 SST − 同纬度无冰海洋格点算术平均；优先 `anomaly_grid.npz`（与 `zonal_ref.csv` 校验残差 1.37e-06 °C），缺失时本地算；`RdBu_r` 对称 ±8 °C（超出截断），0 线加粗。**不是相对时间平均** |
 | `global_sst_map.html` | **自包含交互地图**（年均/1月/7月/7月−1月/同纬度异常五图层，int16×100 差分+gzip 内嵌、零网络）：滚轮缩放 / 拖动 / Shift 框选统计 / 双击放大 / 重置 / 快捷跳转 / URL hash 深链；显示经纬度、海盆与年均/1月/7月/温差/异常读数，25 °C 等值线与灰色陆地；权威异常场存在时优先内嵌 |
 | `lat_month_heatmap.png` | 全球 12 个月 × 纬度热图，黑色等值线 25 °C，灰色为海洋占比不足的纬度 |
 | `indian_vs_global.png` | 印度洋旧廓线 vs 全球廓线，副图为「印度洋 − 全球」差值（仅重叠纬度、有效值处） |
@@ -218,15 +217,15 @@
 
 | 文件 | 像素 | 体积 |
 | --- | --- | --- |
-| `global_sst_vs_latitude.png` | 2198 × 1457 | 345 KB |
+| `global_sst_vs_latitude.png` | 2198 × 1457 | 546 KB |
 | `basins_sst_vs_latitude.png` | 2605 × 1421 | 421 KB |
-| `global_sst_map.png` | 5760 × 2880 | 2128 KB |
-| `global_sst_map_regions.png` | 3784 × 1951 | 924 KB |
-| `global_sst_map_mollweide.png` | 4800 × 2400 | 957 KB |
-| `global_sst_anomaly.png` | 5760 × 2880 | 1508 KB |
+| `global_sst_map.png` | 5760 × 2880 | 2127 KB |
+| `global_sst_map_regions.png` | 3784 × 1951 | 923 KB |
+| `global_sst_map_mollweide.png` | 4800 × 2400 | 956 KB |
+| `global_sst_anomaly.png` | 5760 × 2880 | 1573 KB |
 | `lat_month_heatmap.png` | 2507 × 1318 | 170 KB |
 | `indian_vs_global.png` | 2140 × 1630 | 205 KB |
-| `global_sst_map.html` | — | 2.10 MB |
+| `global_sst_map.html` | — | 2.66 MB |
 
 > **0.25° ≈ 28 km 是 OISST 数据本身的分辨率上限**：静态地图/放大图只是把原生格点放大到可读像素
 > （4K 地图按 4 px/格目标渲染），交互 HTML 则按当前视口逐像素实时重绘，缩放不会产生插值糊图。
@@ -263,24 +262,35 @@
    `sst_jan/sst_jul` **按需检测**（真实数据可能只保留 annual/jan/jul + basin_mask + valid_steps，
    热图仍用 CSV 月度列）。只在「该纬圈所有海洋格点在 60 个时次都有数据」（`coverage==1`）的纬度
    比较网格纬向平均与 CSV，并在比对前按 `basin_mask` 剔除内陆湖泊。
-4. **在线抽样**：直接向 ERDDAP 取 2–3 个时次 × 约 1° 窄带（很小的请求），与本地同一时次 raw
+4. **无冰复算**：新增 `--ice-raw-dir`（默认 `data/raw_global_ice`，不存在则 SKIP）；读取
+   `raw_global` + `raw_global_ice`（ice 缺失/NaN 或 `<0.15` 视为无冰），抽 **6 个纬度 × 1/7 月 +
+   无冰年均**，与 `sst_*_icefree` 对齐到 **0.01 °C**。
+5. **异常场自洽**：`sst_annual_anom ≈ sst_annual_icefree − zonal_ref.ref_annual`，
+   在冰区/陆地 NaN 之外残差 **< 1e-3 °C**。
+6. **统计列健全性**：`p10 ≤ p90`、`interannual_std ≥ 0`、`warmest/coldest_month ∈ [1,12]`、
+   `sst_warmest ≥ sst_coldest`、`seasonal_amp ≈ sst_warmest − sst_coldest`。
+7. **在线抽样**：直接向 ERDDAP 取 2–3 个时次 × 约 1° 窄带（很小的请求），与本地同一时次 raw
    逐纬圈比对，容差 **0.05 °C**；网络不通时输出「跳过在线复核」，**不算失败**。
-5. **印度洋回归**：用 `data/zonal_mean.csv` 复算旧 README 的三个关键数字。
-6. 结果写入 `data/verify_report.json`（或 `--report` 指定路径），打印汇总；
+8. **印度洋回归**：用 `data/zonal_mean.csv` 复算旧 README 的三个关键数字。
+9. 结果写入 `data/verify_report.json`（或 `--report` 指定路径），打印汇总；
    **实际比对失败才非零退出**，数据未就绪/网络不通只记 `skip`。
 
-真实数据最终复核（60 个 raw 时次 + ERDDAP 在线抽样，耗时约 **20.9 s**）：
+真实数据最终复核（60 个 raw 时次 + raw_global_ice + ERDDAP 在线抽样，耗时约 **41.8 s**）：
 
 ```text
-$ python scripts/verify.py --raw-dir <...>\raw_global --report .tmp\verify_report_final.json
+$ python scripts/verify.py --raw-dir <...>\raw_global \
+    --ice-raw-dir <...>\raw_global_ice --report .tmp\verify_report_final.json
 统计域掩膜：basin_mask.npz::basin_mask（剔除内陆湖泊/陆地）
 [PASS] zonal_mean_global.csv 结构
 [PASS] zonal_mean_basins.csv 结构（674/506/506/361/94/74 行，按纬度对齐）
 [PASS] climatology_grid.npz 一致性
 [PASS] data/raw 独立数值复算（24 个比对，最大偏差 0.0005 °C）
+[PASS] raw_global_ice 无冰纬向平均独立复算（18 个比对，最大偏差 0.0005 °C）
+[PASS] anomaly_grid 同纬度残差（689848 格，max=1.37e-06 °C）
+[PASS] 统计列健全性（8 列；seasonal_amp 最大差 0.0010 °C）
 [PASS] ERDDAP 在线抽样复核（3 时次 × 18 样本，最大偏差 0.0000 °C）
 [PASS] 印度洋旧结果回归（29.14 °C @ 2.12°N；21.66°S；26.16 °C）
-结论：pass（通过 6 / 失败 0 / 跳过 0），退出码 0
+结论：pass（通过 9 / 失败 0 / 跳过 0），退出码 0
 ```
 
 fixture 自测仍保留：`verify.py --data-dir .tmp/fixture --skip-online` →
@@ -293,27 +303,38 @@ fixture 自测仍保留：`verify.py --data-dir .tmp/fixture --skip-online` →
 
 ## 8. 关键结果
 
-> 以下数字全部来自本次真实数据运行（`scripts/plot.py` 生成正式图；`scripts/verify.py` 6 项 PASS），
+> 以下数字全部来自本次真实数据运行（`scripts/plot.py` 生成正式图；`scripts/verify.py` 9 项 PASS），
 > 并与 `data/summary_metrics.json` 逐项交叉核对：66 项中 **0 项超差**（温度容差 0.01 °C、纬度容差 0.05°）。
 
 - **全球年均 SST 最高 28.63 °C，出现在 5.875°N**；最低 **−1.70 °C，出现在 89.625°N**（北冰洋高纬）。
 - **年均 25 °C 等温线：北半球 25.55°N、南半球 19.53°S**；
   **0 °C 等温线：北半球 75.97°N、南半球 62.26°S**。
 - **有效纬度范围：78.375°S – 89.875°N**（46 个 `ocean_grid_count=0` 的南极大陆圈纬度不输出）。
-- **全球 / 五大洋 cos(lat)·valid_count 加权年均 SST**：
+- **全球 / 五大洋 cos(lat)·valid_count 加权年均 SST（含冰 vs 无冰并列）**：
 
-  | 海盆 | 年均 SST（°C） |
-  | --- | --- |
-  | 全球 | 18.49 |
-  | 太平洋 | 21.18 |
-  | 大西洋 | 19.00 |
-  | 印度洋 | 20.59 |
-  | 北冰洋 | 0.22 |
-  | 南大洋 | −0.74 |
+  | 海盆 | 含冰年均（°C） | 无冰年均（°C） | 差值（°C） | 冰覆盖 |
+  | --- | ---: | ---: | ---: | ---: |
+  | 全球 | 18.488 | 19.822 | +1.334 | 6.28% |
+  | 太平洋 | 21.178 | 21.250 | +0.073 | 0.38% |
+  | 大西洋 | 18.995 | 19.409 | +0.414 | 2.07% |
+  | 印度洋 | 20.587 | 20.695 | +0.108 | 0.51% |
+  | 北冰洋 | 0.216 | 3.241 | +3.025 | 63.94% |
+  | 南大洋 | −0.740 | 0.124 | +0.864 | 53.86% |
+
+  > 含冰 = 原 `mean_sst_cos_weighted`；无冰 = `ice<0.15` 的 icefree 口径，**两者并列展示，不静默替换**。
 
 - **季节振幅随纬度增大**：42.125°N 处最大，1 月 10.66 °C / 7 月 18.33 °C（振幅 7.67 °C）；
   赤道 0.125°N 仅 1 月 27.85 °C / 7 月 27.26 °C（振幅 0.59 °C）；20.125°S 为 1 月 26.19 °C /
   7 月 23.42 °C（南半球反相）。
+- **最暖/最冷月滞后**：40°N 真实最暖月为 **8 月**（23.10 °C）、最冷月 **3 月**（12.49 °C，
+  季节振幅 10.61 °C）；40°S 最暖 **2 月**、最冷 **9 月**。图注明确「真实最暖/最冷月，不是 1/7 月」。
+- **空间离散 vs 年际波动**：65.875°N 的 P10–P90 空间差异最大（9.09 °C）；79.375°N 的
+  5 年年际 ±1σ 最大（0.454 °C）。**P10–P90 是空间离散，年际带是 5 年波动，两者都不是误差条。**
+- **同纬度异常亮点**（相对同纬度无冰海洋平均）：湾流 **+5.45 °C**、黑潮 **+2.70 °C**、
+  秘鲁寒流 **−5.80 °C**、东太平洋冷舌 **−3.29 °C**、本格拉寒流 **−6.94 °C**。
+- **投影用途**：Mollweide 等面积图用于面积/全球对比；等经纬 4K 图用于经纬度定位与细节阅读，两者并存。
+- **交互 HTML**：**2.66 MB**（gzip 后 <3 MB）；五图层、Shift 框选统计、URL hash 深链、
+  南海/东海/地中海/墨西哥湾快捷跳转，离线可用。
 - **内陆水体**：里海 719 + 五大湖 531 + 拉多加湖 52 = **1302 格** 按 `basin_mask=0` 剔除；
   raw 中这些格点仍有温度，但不进入纬向平均。
 

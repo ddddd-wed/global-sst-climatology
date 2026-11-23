@@ -14,9 +14,14 @@
    缺失行在 global CSV 中必须 ``ocean_grid_count == 0``（反之亦然）。
 3. **网格一致性**：``climatology_grid.npz`` 至少含 lat/lon/sst_annual，月度键按需；在"有效格点全覆盖"
    的纬度上比较网格纬向平均与 CSV（比对前按 basin_mask 剔除内陆湖泊）。
-4. **在线抽样**：直接向 ERDDAP 取 2–3 个时次 × 一条约 1° 宽的纬度带（很小的请求），
+4. **无冰复算**：读取 ``raw_global`` + ``raw_global_ice``（ice 缺失/NaN 或 <0.15 视为无冰），
+   抽 6 个纬度 × 1/7 月 + 无冰年均，与 ``sst_*_icefree`` 对齐到 0.01 °C；海冰 raw 缺失时跳过。
+5. **异常场自洽**：``sst_annual_anom ≈ sst_annual_icefree − zonal_ref.ref_annual``，残差 < 1e-3 °C。
+6. **统计列健全性**：``p10 ≤ p90``、``interannual_std ≥ 0``、月份 1–12、``warmest ≥ coldest``、
+   ``seasonal_amp ≈ warmest − coldest``。
+7. **在线抽样**：直接向 ERDDAP 取 2–3 个时次 × 一条约 1° 宽的纬度带（很小的请求），
    与本地同一时次的 ``data/raw/`` 逐纬圈比对，容差 0.05 °C；网络不通时**跳过**，不算失败。
-5. **印度洋回归**：用仓库已提交的 ``data/zonal_mean.csv``（281 行）复算 README 现值
+8. **印度洋回归**：用仓库已提交的 ``data/zonal_mean.csv``（281 行）复算 README 现值
    （最高 29.14 °C @ 2.12°N、25 °C 等温线 21.66°S、海盆均值 26.16 °C），证明全球版没有改口径。
 
 结果写入 ``data/verify_report.json``（或 ``--report`` 指定路径），并打印结论。
@@ -26,7 +31,7 @@
 
     python scripts/verify.py
     python scripts/verify.py --data-dir .tmp/fixture --skip-online   # 复核合成 fixture
-    python scripts/verify.py --data-dir <数据目录> --raw-dir <raw目录> --report .tmp/x.json --skip-online
+    python scripts/verify.py --data-dir <数据目录> --raw-dir <raw目录> --ice-raw-dir <ice目录> --report .tmp/x.json --skip-online
 """
 
 from __future__ import annotations
@@ -50,6 +55,9 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = ROOT / "data"
 DEFAULT_RAW_DIR = DEFAULT_DATA_DIR / "raw_global"   # 全球 raw；旧 data/raw 只服务印度洋回归
+DEFAULT_ICE_RAW_DIR = DEFAULT_DATA_DIR / "raw_global_ice"
+ANOMALY_NPZ = DEFAULT_DATA_DIR / "anomaly_grid.npz"
+ZONAL_REF_CSV = DEFAULT_DATA_DIR / "zonal_ref.csv"
 INDIAN_CSV = ROOT / "data" / "zonal_mean.csv"
 
 N_LAT_GLOBAL = 720
@@ -80,6 +88,7 @@ INDIAN_BASELINE = {
 }
 
 RAW_RE = re.compile(r"sst_(\d{4})_(\d{2})\.csv(?:\.gz)?$")
+ICE_RE = re.compile(r"ice_(\d{4})_(\d{2})\.csv(?:\.gz)?$")
 
 
 # --------------------------------------------------------------------------- #
@@ -152,6 +161,20 @@ def read_raw_csv(path: Path) -> pd.DataFrame:
         skiprows=skiprows,
         usecols=["latitude", "longitude", "sst"],
         dtype={"latitude": "float64", "longitude": "float64", "sst": "float64"},
+    )
+
+
+def read_ice_csv(path: Path) -> pd.DataFrame:
+    """读取单个时次海冰 CSV（ice 为 0–1；无冰格点缺失/NaN）。"""
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
+        head = [fh.readline() for _ in range(2)]
+    skiprows = [1] if len(head) > 1 and ("UTC" in head[1] or "degrees" in head[1]) else []
+    return pd.read_csv(
+        path,
+        skiprows=skiprows,
+        usecols=["latitude", "longitude", "ice"],
+        dtype={"latitude": "float64", "longitude": "float64", "ice": "float64"},
     )
 
 
@@ -643,6 +666,17 @@ def list_raw_files(raw_dir: Path) -> list[tuple[tuple[int, int], Path]]:
     return out
 
 
+def list_ice_files(ice_dir: Path) -> list[tuple[tuple[int, int], Path]]:
+    if not ice_dir.exists():
+        return []
+    out: list[tuple[tuple[int, int], Path]] = []
+    for path in sorted(ice_dir.iterdir()):
+        match = ICE_RE.search(path.name)
+        if match:
+            out.append(((int(match.group(1)), int(match.group(2))), path))
+    return out
+
+
 def recompute_zonal_from_raw(
     files: list[tuple[tuple[int, int], Path]],
     ocean_mask: np.ndarray | None = None,
@@ -707,6 +741,75 @@ def recompute_zonal_from_raw(
         annual = np.nanmean(clim, axis=0)
     count_stack = np.vstack([counts[key] for key in sorted(counts)])
     return lat_ref, clim, annual, count_stack
+
+
+def recompute_icefree_zonal(
+    raw_dir: Path,
+    ice_dir: Path,
+    ocean_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """独立复算无冰纬向平均：ice 缺失/NaN 或 ice<0.15 视为无冰，SST 取 raw_global。"""
+    sst_files = dict(list_raw_files(raw_dir))
+    ice_files = dict(list_ice_files(ice_dir))
+    keys = sorted(set(sst_files) & set(ice_files))
+    if len(keys) != 60:
+        raise ValueError(f"raw_global/raw_global_ice 配对时次为 {len(keys)}，需 60")
+
+    lat_ref: np.ndarray | None = None
+    n_lat = n_lon = 0
+    means: dict[tuple[int, int], np.ndarray] = {}
+    counts: dict[tuple[int, int], np.ndarray] = {}
+    for i, key in enumerate(keys, start=1):
+        sst_df = read_raw_csv(sst_files[key])
+        ice_df = read_ice_csv(ice_files[key])
+        lat_s = sst_df["latitude"].to_numpy(dtype=float)
+        lon_s = sst_df["longitude"].to_numpy(dtype=float)
+        lat_i = ice_df["latitude"].to_numpy(dtype=float)
+        lon_i = ice_df["longitude"].to_numpy(dtype=float)
+        if not (np.array_equal(lat_s, lat_i) and np.array_equal(lon_s, lon_i)):
+            raise ValueError(f"{sst_files[key].name} 与 {ice_files[key].name} 经纬度顺序不一致")
+        if lat_ref is None:
+            lat_ref = np.unique(lat_s)
+            n_lat, n_lon = len(lat_ref), len(np.unique(lon_s))
+            if n_lat * n_lon != len(sst_df):
+                raise ValueError(f"{sst_files[key].name} 行数 {len(sst_df)} != {n_lat}×{n_lon}")
+            if ocean_mask is not None and ocean_mask.shape != (n_lat, n_lon):
+                raise ValueError(f"ocean_mask 形状 {ocean_mask.shape} != {(n_lat, n_lon)}")
+        if len(sst_df) != n_lat * n_lon or len(ice_df) != n_lat * n_lon:
+            raise ValueError(f"{key} 行数与网格 {n_lat}×{n_lon} 不一致")
+        sst = sst_df["sst"].to_numpy(dtype=float).reshape(n_lat, n_lon)
+        ice = ice_df["ice"].to_numpy(dtype=float).reshape(n_lat, n_lon)
+        # 海冰文件只含 ice>=0.15 的格点；无冰/无海冰格点为 NaN。NaN 视为无冰。
+        ice_free = (~np.isfinite(ice)) | (ice < 0.15)
+        valid = np.isfinite(sst) & ice_free
+        if ocean_mask is not None:
+            valid &= ocean_mask
+        c = valid.sum(axis=1).astype(float)
+        s = np.where(valid, sst, 0.0).sum(axis=1)
+        zonal = np.full(n_lat, np.nan, dtype=float)
+        nz = c > 0
+        zonal[nz] = s[nz] / c[nz]
+        means[key] = zonal
+        counts[key] = c
+        if i % 10 == 0 or i == len(keys):
+            print(f"  无冰 raw 重算 [{i:02d}/{len(keys)}] {sst_files[key].name}", flush=True)
+
+    assert lat_ref is not None
+    years = sorted({y for y, _ in means})
+    clim = np.full((12, len(lat_ref)), np.nan, dtype=float)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for i, month in enumerate(range(1, 13)):
+            stack = np.vstack([means[(y, month)] for y in years])
+            clim[i] = np.nanmean(stack, axis=0)
+        annual = np.nanmean(clim, axis=0)
+    return lat_ref, clim, annual
+
+
+
+    """快速读取首个 raw 文件，返回 (纬度格点数, 经度格点数)。"""
+    df = read_raw_csv(path)
+    return int(df["latitude"].nunique()), int(df["longitude"].nunique())
 
 
 def probe_raw_grid(path: Path) -> tuple[int, int]:
@@ -806,6 +909,156 @@ def check_raw_recompute(
         f"最大偏差 {max_diff:.4f} °C ≤ {NUMERIC_TOL}（对齐 {target_label}；统计域 {mask_source}）",
         metrics,
     )
+
+
+def check_icefree_recompute(
+    raw_dir: Path,
+    ice_dir: Path,
+    target_df: pd.DataFrame | None,
+    ocean_mask: np.ndarray | None,
+    mask_source: str,
+) -> dict:
+    name = "raw_global_ice 无冰纬向平均独立复算"
+    if not ice_dir.exists():
+        return make_check(name, "skip", f"未找到 {ice_dir}，跳过无冰复算（不判失败）")
+    files = list_ice_files(ice_dir)
+    if len(files) != 60:
+        return make_check(name, "skip", f"{ice_dir} 只有 {len(files)} 个时次（需 60），跳过")
+    if target_df is None:
+        return make_check(name, "skip", "缺少可对齐的全球纬向平均 CSV，跳过")
+    cols = {"annual": "sst_annual_icefree", "jan": "sst_jan_icefree", "jul": "sst_jul_icefree"}
+    if any(c not in target_df.columns for c in cols.values()):
+        return make_check(name, "skip", "sst_*_icefree 列未就绪，跳过")
+    try:
+        lat_raw, clim, annual = recompute_icefree_zonal(raw_dir, ice_dir, ocean_mask=ocean_mask)
+    except Exception as exc:  # noqa: BLE001
+        return make_check(name, "fail", f"无冰 raw 重算失败：{exc}")
+
+    target = target_df.set_index("latitude")
+    sample_lats = (-60.0, -40.0, -20.0, 0.0, 20.0, 40.0)
+    rows: list[dict[str, Any]] = []
+    problems: list[str] = []
+    for wanted in sample_lats:
+        idx = int(np.argmin(np.abs(lat_raw - wanted)))
+        lat = float(lat_raw[idx])
+        if lat not in target.index:
+            nearest = target.index[np.argmin(np.abs(target.index.to_numpy(dtype=float) - lat))]
+            lat = float(nearest)
+            idx = int(np.argmin(np.abs(lat_raw - lat)))
+        row = target.loc[lat]
+        for month, key in ((1, "jan"), (7, "jul")):
+            raw_v = float(clim[month - 1, idx])
+            csv_v = float(row[cols[key]])
+            diff = abs(raw_v - csv_v) if np.isfinite(raw_v) and np.isfinite(csv_v) else float("inf")
+            rows.append({"latitude": lat, "month": month, "raw": raw_v, "csv": csv_v, "diff": diff})
+            if diff > NUMERIC_TOL:
+                problems.append(f"{lat:.2f}°/{month:02d} 月：raw {raw_v:.4f} vs csv {csv_v:.4f}（Δ={diff:.4f}）")
+        raw_a = float(annual[idx])
+        csv_a = float(row[cols["annual"]])
+        diff_a = abs(raw_a - csv_a) if np.isfinite(raw_a) and np.isfinite(csv_a) else float("inf")
+        rows.append({"latitude": lat, "month": "annual", "raw": raw_a, "csv": csv_a, "diff": diff_a})
+        if diff_a > NUMERIC_TOL:
+            problems.append(f"{lat:.2f}° 无冰年均：raw vs csv Δ={diff_a:.4f}")
+    max_diff = max(r["diff"] for r in rows)
+    metrics = {"n_timesteps": len(files), "ice_raw_dir": str(ice_dir), "mask_source": mask_source,
+               "sample_lats": sample_lats, "max_abs_diff": max_diff, "samples": rows}
+    if problems:
+        return make_check(name, "fail", "；".join(problems[:8]), metrics)
+    return make_check(
+        name, "pass",
+        f"60 时次无冰复算，6 纬度 × 1/7 月 + 无冰年均共 {len(rows)} 个比对，"
+        f"最大偏差 {max_diff:.4f} °C ≤ {NUMERIC_TOL}（统计域 {mask_source}）", metrics,
+    )
+
+
+def check_anomaly_grid(data_dir: Path) -> dict:
+    name = "anomaly_grid 同纬度残差"
+    anom_path = data_dir / "anomaly_grid.npz"
+    ref_path = data_dir / "zonal_ref.csv"
+    if not anom_path.exists() or not ref_path.exists():
+        return make_check(name, "skip", "anomaly_grid.npz 或 zonal_ref.csv 未就绪，跳过")
+    try:
+        with np.load(anom_path) as npz:
+            needed = {"sst_annual_anom", "sst_annual_icefree"}
+            if not needed.issubset(npz.files):
+                return make_check(name, "skip", f"anomaly_grid.npz 缺少 {sorted(needed - set(npz.files))}")
+            anom = npz["sst_annual_anom"].astype(float)
+            icefree = npz["sst_annual_icefree"].astype(float)
+        ref = pd.read_csv(ref_path)
+        expected = icefree - ref["ref_annual"].to_numpy(dtype=float)[:, None]
+        ok = np.isfinite(expected) & np.isfinite(anom)
+        if not ok.any():
+            return make_check(name, "skip", "anomaly/ref 没有共同有效格点")
+        residual = np.abs(expected[ok] - anom[ok])
+        max_res = float(residual.max())
+        metrics = {"n_valid": int(ok.sum()), "max_abs_residual": max_res,
+                   "p99_residual": float(np.percentile(residual, 99))}
+        if max_res > 1e-3:
+            return make_check(name, "fail",
+                              f"max|anom-(icefree-ref)|={max_res:.6f} °C > 1e-3（{ok.sum()} 格点）", metrics)
+        return make_check(name, "pass",
+                          f"{ok.sum()} 个有效格点，max|anom-(icefree-ref)|={max_res:.2e} °C ≤ 1e-3",
+                          metrics)
+    except Exception as exc:  # noqa: BLE001
+        return make_check(name, "fail", f"异常场校验失败：{exc}")
+
+
+def check_stats_columns(data_dir: Path) -> dict:
+    name = "统计列健全性"
+    path = data_dir / "zonal_mean_global.csv"
+    if not path.exists():
+        return make_check(name, "skip", "zonal_mean_global.csv 未就绪，跳过")
+    df = pd.read_csv(path)
+    needed = [
+        "sst_p10", "sst_p90", "sst_interannual_std", "sst_warmest", "sst_coldest",
+        "seasonal_amp", "warmest_month", "coldest_month",
+    ]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        return make_check(name, "skip", f"统计列未就绪：缺少 {', '.join(missing)}")
+    issues: list[str] = []
+    counts: dict[str, int] = {}
+    for col in needed:
+        counts[col] = int(np.isfinite(df[col].to_numpy(dtype=float)).sum())
+    p10 = df["sst_p10"].to_numpy(float)
+    p90 = df["sst_p90"].to_numpy(float)
+    ok = np.isfinite(p10) & np.isfinite(p90)
+    bad = ok & (p10 > p90 + 1e-9)
+    if bad.any():
+        issues.append(f"p10>p90 在 {int(bad.sum())} 个纬度")
+    istd = df["sst_interannual_std"].to_numpy(float)
+    bad = np.isfinite(istd) & (istd < -1e-9)
+    if bad.any():
+        issues.append(f"interannual_std<0 在 {int(bad.sum())} 个纬度")
+    for col in ("warmest_month", "coldest_month"):
+        vals = df[col].to_numpy(float)
+        okm = np.isfinite(vals)
+        if okm.any():
+            bad = okm & ((vals < 1 - 1e-9) | (vals > 12 + 1e-9) | (np.abs(vals - np.round(vals)) > 1e-9))
+            if bad.any():
+                issues.append(f"{col} 越界/非整数在 {int(bad.sum())} 个纬度")
+        counts[col] = int(okm.sum())
+    warm = df["sst_warmest"].to_numpy(float)
+    cold = df["sst_coldest"].to_numpy(float)
+    ok = np.isfinite(warm) & np.isfinite(cold)
+    bad = ok & (warm < cold - 1e-9)
+    if bad.any():
+        issues.append(f"sst_warmest<sst_coldest 在 {int(bad.sum())} 个纬度")
+    amp = df["seasonal_amp"].to_numpy(float)
+    okamp = ok & np.isfinite(amp)
+    if okamp.any():
+        amp_diff = float(np.max(np.abs((warm - cold)[okamp] - amp[okamp])))
+        if amp_diff > 0.01:
+            issues.append(f"seasonal_amp 与 warmest-coldest 最大差 {amp_diff:.4f} °C > 0.01")
+    else:
+        amp_diff = float("nan")
+    metrics = {"counts": counts, "seasonal_amp_max_diff": amp_diff}
+    if issues:
+        return make_check(name, "fail", "；".join(issues), metrics)
+    return make_check(name, "pass",
+                      f"{len(needed)} 个统计列通过：p10≤p90、std≥0、月份 1–12、warmest≥coldest、"
+                      f"seasonal_amp≈warmest−coldest（max diff {amp_diff:.4f} °C）", metrics)
+
 
 
 # --------------------------------------------------------------------------- #
@@ -917,9 +1170,13 @@ def check_indian_regression(path: Path) -> dict:
 # --------------------------------------------------------------------------- #
 # 主流程
 # --------------------------------------------------------------------------- #
-def run(data_dir: Path, raw_dir: Path, report_path: Path, skip_online: bool) -> dict:
+def run(data_dir: Path, raw_dir: Path, report_path: Path, skip_online: bool,
+        ice_raw_dir: Path | None = None) -> dict:
     data_dir = data_dir.resolve()
     raw_dir = raw_dir.resolve()
+    if ice_raw_dir is None:
+        ice_raw_dir = data_dir / "raw_global_ice"
+    ice_raw_dir = ice_raw_dir.resolve()
     global_csv = data_dir / "zonal_mean_global.csv"
     basins_csv = data_dir / "zonal_mean_basins.csv"
     grid_npz = data_dir / "climatology_grid.npz"
@@ -968,6 +1225,9 @@ def run(data_dir: Path, raw_dir: Path, report_path: Path, skip_online: bool) -> 
         ]
     checks += [
         check_raw_recompute(raw_dir, target_df, target_label, ocean_mask, mask_source),
+        check_icefree_recompute(raw_dir, ice_raw_dir, target_df, ocean_mask, mask_source),
+        check_anomaly_grid(data_dir),
+        check_stats_columns(data_dir),
         check_online(raw_dir, skip_online),
         check_indian_regression(INDIAN_CSV),
     ]
@@ -980,6 +1240,7 @@ def run(data_dir: Path, raw_dir: Path, report_path: Path, skip_online: bool) -> 
         "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "data_dir": str(data_dir),
         "raw_dir": str(raw_dir),
+        "ice_raw_dir": str(ice_raw_dir),
         "mode": "fixture" if ".tmp" in str(data_dir) else "real",
         "overall": overall,
         "counts": {"pass": n_pass, "fail": n_fail, "skip": n_skip},
@@ -1004,6 +1265,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="独立复核全球 SST 分析结果（不依赖 compute.py）")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--raw-dir", type=Path, default=None, help="默认 <data-dir>/raw_global")
+    parser.add_argument("--ice-raw-dir", type=Path, default=None,
+                        help="海冰 raw，默认 <data-dir>/raw_global_ice；不存在则 SKIP")
     parser.add_argument("--report", type=Path, default=None, help="默认 <data-dir>/verify_report.json")
     parser.add_argument("--skip-online", action="store_true", help="跳过 ERDDAP 在线抽样")
     args = parser.parse_args()
@@ -1016,7 +1279,13 @@ def main() -> int:
     else:
         raw_dir = data_dir / "raw_global"
     report_path = args.report if args.report is not None else data_dir / "verify_report.json"
-    report = run(data_dir, raw_dir, report_path, args.skip_online)
+    if args.ice_raw_dir is not None:
+        ice_raw_dir = args.ice_raw_dir
+    elif data_dir.resolve() == DEFAULT_DATA_DIR.resolve():
+        ice_raw_dir = DEFAULT_ICE_RAW_DIR
+    else:
+        ice_raw_dir = data_dir / "raw_global_ice"
+    report = run(data_dir, raw_dir, report_path, args.skip_online, ice_raw_dir=ice_raw_dir)
     return 1 if report["overall"] == "fail" else 0
 
 
