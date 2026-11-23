@@ -1,4 +1,6 @@
 {
+  "icefree_definition": "ice < 0.15 (OISST ice variable)",
+  "ice_threshold": 0.15,
   "weighting": "cos(lat)*valid_count",
   "coverage_definition": "valid_count / ocean_grid_count",
   "basins": {
@@ -34,7 +36,43 @@
       "valid_lat_min": -78.375,
       "valid_lat_max": 89.875,
       "ocean_grid_total": 689848,
-      "lat_row_count": 674
+      "lat_row_count": 674,
+      "icefree": {
+        "basin_id": null,
+        "name_zh": "全球海洋",
+        "name_en": "Global Ocean",
+        "weighting": "cos(lat)*valid_count",
+        "coverage_definition": "valid_count / ocean_grid_count",
+        "mean_sst_cos_weighted": 19.8221,
+        "area_weighted_annual_sst": 19.8221,
+        "grid_area_weighted_annual_sst": 18.5452,
+        "max_sst_lat": 5.875,
+        "max_sst_c": 28.631,
+        "min_sst_lat": -78.375,
+        "min_sst_c": -1.671,
+        "isotherms_25c": {
+          "all": [
+            -19.5346,
+            25.5527
+          ],
+          "north": 25.5527,
+          "south": -19.5346
+        },
+        "isotherms_0c": {
+          "all": [
+            -64.3781,
+            79.923
+          ],
+          "north": 79.923,
+          "south": -64.3781
+        },
+        "valid_lat_min": -78.375,
+        "valid_lat_max": 82.125,
+        "ocean_grid_total": 689848,
+        "lat_row_count": 674,
+        "delta_vs_all_ocean_c": 1.3338,
+        "mean_ice_frac": 0.0628
+      }
     },
     "pacific": {
       "basin_id": 1,
@@ -65,7 +103,40 @@
       "valid_lat_min": -59.875,
       "valid_lat_max": 66.375,
       "ocean_grid_total": 271745,
-      "lat_row_count": 506
+      "lat_row_count": 506,
+      "icefree": {
+        "basin_id": 1,
+        "name_zh": "太平洋",
+        "name_en": "Pacific Ocean",
+        "weighting": "cos(lat)*valid_count",
+        "coverage_definition": "valid_count / ocean_grid_count",
+        "mean_sst_cos_weighted": 21.2502,
+        "area_weighted_annual_sst": 21.2502,
+        "grid_area_weighted_annual_sst": 21.189,
+        "max_sst_lat": 6.875,
+        "max_sst_c": 28.715,
+        "min_sst_lat": -59.875,
+        "min_sst_c": 2.445,
+        "isotherms_25c": {
+          "all": [
+            -20.4673,
+            24.4928
+          ],
+          "north": 24.4928,
+          "south": -20.4673
+        },
+        "isotherms_0c": {
+          "all": [],
+          "north": null,
+          "south": null
+        },
+        "valid_lat_min": -59.875,
+        "valid_lat_max": 66.375,
+        "ocean_grid_total": 271745,
+        "lat_row_count": 506,
+        "delta_vs_all_ocean_c": 0.0726,
+        "mean_ice_frac": 0.0038
+      }
     },
     "atlantic": {
       "basin_id": 2,
@@ -98,7 +169,40 @@
       "valid_lat_min": -59.875,
       "valid_lat_max": 66.375,
       "ocean_grid_total": 146436,
-      "lat_row_count": 506
+      "lat_row_count": 506,
+      "icefree": {
+        "basin_id": 2,
+        "name_zh": "大西洋",
+        "name_en": "Atlantic Ocean",
+        "weighting": "cos(lat)*valid_count",
+        "coverage_definition": "valid_count / ocean_grid_count",
+        "mean_sst_cos_weighted": 19.4094,
+        "area_weighted_annual_sst": 19.4094,
+        "grid_area_weighted_annual_sst": 19.0344,
+        "max_sst_lat": 3.625,
+        "max_sst_c": 28.231,
+        "min_sst_lat": -59.875,
+        "min_sst_c": 0.104,
+        "isotherms_25c": {
+          "all": [
+            -12.5404,
+            26.8031
+          ],
+          "north": 26.8031,
+          "south": -12.5404
+        },
+        "isotherms_0c": {
+          "all": [],
+          "north": null,
+          "south": null
+        },
+        "valid_lat_min": -59.875,
+        "valid_lat_max": 66.375,
+        "ocean_grid_total": 146436,
+        "lat_row_count": 506,
+        "delta_vs_all_ocean_c": 0.4144,
+        "mean_ice_frac": 0.0207
+      }
     },
     "indian": {
       "basin_id": 3,
@@ -130,7 +234,39 @@
       "valid_lat_min": -59.875,
       "valid_lat_max": 30.125,
       "ocean_grid_total": 99361,
-      "lat_row_count": 361
+      "lat_row_count": 361,
+      "icefree": {
+        "basin_id": 3,
+        "name_zh": "印度洋",
+        "name_en": "Indian Ocean",
+        "weighting": "cos(lat)*valid_count",
+        "coverage_definition": "valid_count / ocean_grid_count",
+        "mean_sst_cos_weighted": 20.695,
+        "area_weighted_annual_sst": 20.695,
+        "grid_area_weighted_annual_sst": 20.5941,
+        "max_sst_lat": -0.125,
+        "max_sst_c": 29.103,
+        "min_sst_lat": -59.875,
+        "min_sst_c": 0.247,
+        "isotherms_25c": {
+          "all": [
+            -21.6641
+          ],
+          "north": null,
+          "south": -21.6641
+        },
+        "isotherms_0c": {
+          "all": [],
+          "north": null,
+          "south": null
+        },
+        "valid_lat_min": -59.875,
+        "valid_lat_max": 30.125,
+        "ocean_grid_total": 99361,
+        "lat_row_count": 361,
+        "delta_vs_all_ocean_c": 0.1078,
+        "mean_ice_frac": 0.0051
+      }
     },
     "arctic": {
       "basin_id": 4,
@@ -160,7 +296,39 @@
       "valid_lat_min": 66.625,
       "valid_lat_max": 89.875,
       "ocean_grid_total": 101837,
-      "lat_row_count": 94
+      "lat_row_count": 94,
+      "icefree": {
+        "basin_id": 4,
+        "name_zh": "北冰洋",
+        "name_en": "Arctic Ocean",
+        "weighting": "cos(lat)*valid_count",
+        "coverage_definition": "valid_count / ocean_grid_count",
+        "mean_sst_cos_weighted": 3.241,
+        "area_weighted_annual_sst": 3.241,
+        "grid_area_weighted_annual_sst": 0.6643,
+        "max_sst_lat": 66.875,
+        "max_sst_c": 5.512,
+        "min_sst_lat": 81.625,
+        "min_sst_c": -1.338,
+        "isotherms_25c": {
+          "all": [],
+          "north": null,
+          "south": null
+        },
+        "isotherms_0c": {
+          "all": [
+            79.923
+          ],
+          "north": 79.923,
+          "south": null
+        },
+        "valid_lat_min": 66.625,
+        "valid_lat_max": 82.125,
+        "ocean_grid_total": 101837,
+        "lat_row_count": 94,
+        "delta_vs_all_ocean_c": 3.0253,
+        "mean_ice_frac": 0.6394
+      }
     },
     "southern": {
       "basin_id": 5,
@@ -190,16 +358,325 @@
       "valid_lat_min": -78.375,
       "valid_lat_max": -60.125,
       "ocean_grid_total": 70469,
-      "lat_row_count": 74
+      "lat_row_count": 74,
+      "icefree": {
+        "basin_id": 5,
+        "name_zh": "南大洋",
+        "name_en": "Southern Ocean",
+        "weighting": "cos(lat)*valid_count",
+        "coverage_definition": "valid_count / ocean_grid_count",
+        "mean_sst_cos_weighted": 0.124,
+        "area_weighted_annual_sst": 0.124,
+        "grid_area_weighted_annual_sst": -0.3288,
+        "max_sst_lat": -60.125,
+        "max_sst_c": 1.408,
+        "min_sst_lat": -78.375,
+        "min_sst_c": -1.671,
+        "isotherms_25c": {
+          "all": [],
+          "north": null,
+          "south": null
+        },
+        "isotherms_0c": {
+          "all": [
+            -64.3781
+          ],
+          "north": null,
+          "south": -64.3781
+        },
+        "valid_lat_min": -78.375,
+        "valid_lat_max": -60.125,
+        "ocean_grid_total": 70469,
+        "lat_row_count": 74,
+        "delta_vs_all_ocean_c": 0.8641,
+        "mean_ice_frac": 0.5386
+      }
+    }
+  },
+  "basins_icefree": {
+    "global": {
+      "basin_id": null,
+      "name_zh": "全球海洋",
+      "name_en": "Global Ocean",
+      "weighting": "cos(lat)*valid_count",
+      "coverage_definition": "valid_count / ocean_grid_count",
+      "mean_sst_cos_weighted": 19.8221,
+      "area_weighted_annual_sst": 19.8221,
+      "grid_area_weighted_annual_sst": 18.5452,
+      "max_sst_lat": 5.875,
+      "max_sst_c": 28.631,
+      "min_sst_lat": -78.375,
+      "min_sst_c": -1.671,
+      "isotherms_25c": {
+        "all": [
+          -19.5346,
+          25.5527
+        ],
+        "north": 25.5527,
+        "south": -19.5346
+      },
+      "isotherms_0c": {
+        "all": [
+          -64.3781,
+          79.923
+        ],
+        "north": 79.923,
+        "south": -64.3781
+      },
+      "valid_lat_min": -78.375,
+      "valid_lat_max": 82.125,
+      "ocean_grid_total": 689848,
+      "lat_row_count": 674,
+      "delta_vs_all_ocean_c": 1.3338,
+      "mean_ice_frac": 0.0628
+    },
+    "pacific": {
+      "basin_id": 1,
+      "name_zh": "太平洋",
+      "name_en": "Pacific Ocean",
+      "weighting": "cos(lat)*valid_count",
+      "coverage_definition": "valid_count / ocean_grid_count",
+      "mean_sst_cos_weighted": 21.2502,
+      "area_weighted_annual_sst": 21.2502,
+      "grid_area_weighted_annual_sst": 21.189,
+      "max_sst_lat": 6.875,
+      "max_sst_c": 28.715,
+      "min_sst_lat": -59.875,
+      "min_sst_c": 2.445,
+      "isotherms_25c": {
+        "all": [
+          -20.4673,
+          24.4928
+        ],
+        "north": 24.4928,
+        "south": -20.4673
+      },
+      "isotherms_0c": {
+        "all": [],
+        "north": null,
+        "south": null
+      },
+      "valid_lat_min": -59.875,
+      "valid_lat_max": 66.375,
+      "ocean_grid_total": 271745,
+      "lat_row_count": 506,
+      "delta_vs_all_ocean_c": 0.0726,
+      "mean_ice_frac": 0.0038
+    },
+    "atlantic": {
+      "basin_id": 2,
+      "name_zh": "大西洋",
+      "name_en": "Atlantic Ocean",
+      "weighting": "cos(lat)*valid_count",
+      "coverage_definition": "valid_count / ocean_grid_count",
+      "mean_sst_cos_weighted": 19.4094,
+      "area_weighted_annual_sst": 19.4094,
+      "grid_area_weighted_annual_sst": 19.0344,
+      "max_sst_lat": 3.625,
+      "max_sst_c": 28.231,
+      "min_sst_lat": -59.875,
+      "min_sst_c": 0.104,
+      "isotherms_25c": {
+        "all": [
+          -12.5404,
+          26.8031
+        ],
+        "north": 26.8031,
+        "south": -12.5404
+      },
+      "isotherms_0c": {
+        "all": [],
+        "north": null,
+        "south": null
+      },
+      "valid_lat_min": -59.875,
+      "valid_lat_max": 66.375,
+      "ocean_grid_total": 146436,
+      "lat_row_count": 506,
+      "delta_vs_all_ocean_c": 0.4144,
+      "mean_ice_frac": 0.0207
+    },
+    "indian": {
+      "basin_id": 3,
+      "name_zh": "印度洋",
+      "name_en": "Indian Ocean",
+      "weighting": "cos(lat)*valid_count",
+      "coverage_definition": "valid_count / ocean_grid_count",
+      "mean_sst_cos_weighted": 20.695,
+      "area_weighted_annual_sst": 20.695,
+      "grid_area_weighted_annual_sst": 20.5941,
+      "max_sst_lat": -0.125,
+      "max_sst_c": 29.103,
+      "min_sst_lat": -59.875,
+      "min_sst_c": 0.247,
+      "isotherms_25c": {
+        "all": [
+          -21.6641
+        ],
+        "north": null,
+        "south": -21.6641
+      },
+      "isotherms_0c": {
+        "all": [],
+        "north": null,
+        "south": null
+      },
+      "valid_lat_min": -59.875,
+      "valid_lat_max": 30.125,
+      "ocean_grid_total": 99361,
+      "lat_row_count": 361,
+      "delta_vs_all_ocean_c": 0.1078,
+      "mean_ice_frac": 0.0051
+    },
+    "arctic": {
+      "basin_id": 4,
+      "name_zh": "北冰洋",
+      "name_en": "Arctic Ocean",
+      "weighting": "cos(lat)*valid_count",
+      "coverage_definition": "valid_count / ocean_grid_count",
+      "mean_sst_cos_weighted": 3.241,
+      "area_weighted_annual_sst": 3.241,
+      "grid_area_weighted_annual_sst": 0.6643,
+      "max_sst_lat": 66.875,
+      "max_sst_c": 5.512,
+      "min_sst_lat": 81.625,
+      "min_sst_c": -1.338,
+      "isotherms_25c": {
+        "all": [],
+        "north": null,
+        "south": null
+      },
+      "isotherms_0c": {
+        "all": [
+          79.923
+        ],
+        "north": 79.923,
+        "south": null
+      },
+      "valid_lat_min": 66.625,
+      "valid_lat_max": 82.125,
+      "ocean_grid_total": 101837,
+      "lat_row_count": 94,
+      "delta_vs_all_ocean_c": 3.0253,
+      "mean_ice_frac": 0.6394
+    },
+    "southern": {
+      "basin_id": 5,
+      "name_zh": "南大洋",
+      "name_en": "Southern Ocean",
+      "weighting": "cos(lat)*valid_count",
+      "coverage_definition": "valid_count / ocean_grid_count",
+      "mean_sst_cos_weighted": 0.124,
+      "area_weighted_annual_sst": 0.124,
+      "grid_area_weighted_annual_sst": -0.3288,
+      "max_sst_lat": -60.125,
+      "max_sst_c": 1.408,
+      "min_sst_lat": -78.375,
+      "min_sst_c": -1.671,
+      "isotherms_25c": {
+        "all": [],
+        "north": null,
+        "south": null
+      },
+      "isotherms_0c": {
+        "all": [
+          -64.3781
+        ],
+        "north": null,
+        "south": -64.3781
+      },
+      "valid_lat_min": -78.375,
+      "valid_lat_max": -60.125,
+      "ocean_grid_total": 70469,
+      "lat_row_count": 74,
+      "delta_vs_all_ocean_c": 0.8641,
+      "mean_ice_frac": 0.5386
+    }
+  },
+  "dispersion_highlights": {
+    "max_zonal_p90_p10": {
+      "lat": 65.875,
+      "spread_c": 9.088,
+      "sst_p10": -0.08,
+      "sst_p90": 9.008
+    },
+    "max_interannual_std": {
+      "lat": 79.375,
+      "std_c": 0.454,
+      "interannual_min": -0.165,
+      "interannual_max": 1.028
+    },
+    "midlat_40n_seasonal_lag": {
+      "lat": 39.875,
+      "warmest_month": 8,
+      "coldest_month": 3,
+      "sst_warmest": 23.095,
+      "sst_coldest": 12.486,
+      "seasonal_amp": 10.609
+    },
+    "midlat_40s_seasonal_lag": {
+      "lat": -40.125,
+      "warmest_month": 2,
+      "coldest_month": 9,
+      "sst_warmest": 17.597,
+      "sst_coldest": 12.417,
+      "seasonal_amp": 5.18
+    }
+  },
+  "anomaly_checkpoints": {
+    "kuroshio": {
+      "name_zh": "黑潮区",
+      "target_lat": 35.125,
+      "target_lon": 141.625,
+      "grid_lat": 35.125,
+      "grid_lon": 141.625,
+      "sst_annual_anom_c": 2.697
+    },
+    "gulf_stream": {
+      "name_zh": "湾流区",
+      "target_lat": 38.0,
+      "target_lon": 295.0,
+      "grid_lat": 37.875,
+      "grid_lon": 294.875,
+      "sst_annual_anom_c": 5.447
+    },
+    "peru_current": {
+      "name_zh": "秘鲁寒流区",
+      "target_lat": -15.0,
+      "target_lon": 282.0,
+      "grid_lat": -15.125,
+      "grid_lon": 281.875,
+      "sst_annual_anom_c": -5.803
+    },
+    "east_pacific_cold_tongue": {
+      "name_zh": "东太平洋冷舌",
+      "target_lat": -1.0,
+      "target_lon": 250.0,
+      "grid_lat": -1.125,
+      "grid_lon": 249.875,
+      "sst_annual_anom_c": -3.285
+    },
+    "benguela_current": {
+      "name_zh": "本格拉寒流区",
+      "target_lat": -20.0,
+      "target_lon": 12.0,
+      "grid_lat": -20.125,
+      "grid_lon": 11.875,
+      "sst_annual_anom_c": -6.943
     }
   },
   "pipeline": {
     "raw_files_count": 60,
     "raw_gz_mb": 251.77,
     "raw_uncompressed_mb": 2811.54,
-    "compute_seconds": 13.12,
+    "ice_raw_files_count": 60,
+    "ice_raw_gz_mb": 168.63,
+    "ice_raw_uncompressed_mb": 2748.22,
+    "compute_seconds": 26.94,
+    "compute_v2_seconds": 26.94,
     "basin_mask_npz_mb": 0.039,
     "npz_mb": 5.0,
+    "anomaly_grid_npz_mb": 11.25,
     "npz_includes_monthly_grids": false,
     "excluded_inland_cells": 1302,
     "excluded_inland_breakdown": {

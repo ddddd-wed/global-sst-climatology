@@ -13,11 +13,19 @@ ZONAL_CSV = DATA_DIR / "zonal_mean.csv"
 
 # 全球海洋新产物路径契约
 GLOBAL_RAW_DIR = DATA_DIR / "raw_global"
+GLOBAL_ICE_RAW_DIR = DATA_DIR / "raw_global_ice"
 GLOBAL_ZONAL_CSV = DATA_DIR / "zonal_mean_global.csv"
 BASINS_ZONAL_CSV = DATA_DIR / "zonal_mean_basins.csv"
+GLOBAL_ZONAL_ICEFREE_CSV = DATA_DIR / "zonal_mean_global_icefree.csv"
+BASINS_ZONAL_ICEFREE_CSV = DATA_DIR / "zonal_mean_basins_icefree.csv"
+ZONAL_REF_CSV = DATA_DIR / "zonal_ref.csv"
 BASIN_MASK_NPZ = DATA_DIR / "basin_mask.npz"
 CLIMATOLOGY_NPZ = DATA_DIR / "climatology_grid.npz"
+ANOMALY_GRID_NPZ = DATA_DIR / "anomaly_grid.npz"
 SUMMARY_JSON = DATA_DIR / "summary_metrics.json"
+
+# 开阔无冰海面口径阈值：OISST v2.1 ice 为 0.0–1.0 无量纲密集度（无冰处为 NaN）
+ICE_CONC_MAX = 0.15
 
 # 数据源：NOAA OISST v2.1 日平均，0.25° 网格
 DATASET_ID = "ncdcOisst21Agg"
@@ -47,7 +55,9 @@ REGION_PRESETS = {
         "n_lon": 1440,
         "expected_lines": 1_036_802,  # 2 行表头 + 720*1440 行数据
         "raw_dir": GLOBAL_RAW_DIR,
+        "ice_raw_dir": GLOBAL_ICE_RAW_DIR,
         "out_csv": GLOBAL_ZONAL_CSV,
+        "out_csv_icefree": GLOBAL_ZONAL_ICEFREE_CSV,
     },
     "indian_ocean": {
         "name": "indian_ocean",
