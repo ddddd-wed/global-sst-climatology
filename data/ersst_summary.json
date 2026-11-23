@@ -1,0 +1,100 @@
+{
+  "dataset": "NOAA NCEI ERSST v5 (2.0° × 2.0°, nceiErsstv5)",
+  "period": "1982-2024",
+  "clim_period": "1991-2020",
+  "weighting": "cos(lat)*valid_count",
+  "global_mean_1991_2020_c": 18.3008,
+  "global_trend_per_decade_c": {
+    "trend_per_decade_c": 0.1332,
+    "r2": 0.8078,
+    "p_value": 2.83642e-16,
+    "ci95_halfwidth_c_per_decade": 0.0205,
+    "n_years": 43
+  },
+  "arctic_60n_trend_per_decade_c": {
+    "trend_per_decade_c": 0.2209,
+    "r2": 0.8342,
+    "p_value": 1.3511e-17,
+    "ci95_halfwidth_c_per_decade": 0.0311,
+    "n_years": 43
+  },
+  "arctic_amplification_ratio": 1.658,
+  "tropics_trend_per_decade_c": {
+    "trend_per_decade_c": 0.1187,
+    "r2": 0.4677,
+    "p_value": 4.30539e-07,
+    "ci95_halfwidth_c_per_decade": 0.0399,
+    "n_years": 43
+  },
+  "nh_trend_per_decade_c": {
+    "trend_per_decade_c": 0.2039,
+    "r2": 0.874,
+    "p_value": 4.75809e-20,
+    "ci95_halfwidth_c_per_decade": 0.0244,
+    "n_years": 43
+  },
+  "sh_trend_per_decade_c": {
+    "trend_per_decade_c": 0.0793,
+    "r2": 0.6593,
+    "p_value": 3.90738e-11,
+    "ci95_halfwidth_c_per_decade": 0.018,
+    "n_years": 43
+  },
+  "southern_60s_trend_per_decade_c": {
+    "trend_per_decade_c": -0.0433,
+    "r2": 0.3823,
+    "p_value": 9.94859e-06,
+    "ci95_halfwidth_c_per_decade": 0.0174,
+    "n_years": 43
+  },
+  "warmest_year": {
+    "year": 2024,
+    "global_mean_sst_c": 18.7674
+  },
+  "coldest_year": {
+    "year": 1985,
+    "global_mean_sst_c": 18.0076
+  },
+  "cross_validation_2016_2020": {
+    "aggregation_rule": "OISST 0.25° 经 [lat-1.0, lat+1.0) 窗按 cos(lat)*valid_count 聚合至 ERSST 2° 网格",
+    "60S_60N": {
+      "all_ocean": {
+        "n_lat": 61,
+        "mean_bias_c": -0.0868,
+        "mae_c": 0.0915,
+        "rmse_c": 0.1236,
+        "pearson_r": 0.999959
+      },
+      "ice_free": {
+        "n_lat": 61,
+        "mean_bias_c": -0.0105,
+        "mae_c": 0.1099,
+        "rmse_c": 0.1647,
+        "pearson_r": 0.999852
+      }
+    },
+    "global": {
+      "all_ocean": {
+        "n_lat": 83,
+        "mean_bias_c": -0.0694,
+        "mae_c": 0.093,
+        "rmse_c": 0.1197,
+        "pearson_r": 0.999962
+      },
+      "ice_free": {
+        "n_lat": 83,
+        "mean_bias_c": 0.249,
+        "mae_c": 0.3375,
+        "rmse_c": 0.6725,
+        "pearson_r": 0.998821
+      }
+    }
+  },
+  "pipeline": {
+    "raw_files_count": 43,
+    "raw_months_count": 516,
+    "raw_gz_mb": 47.83,
+    "raw_uncompressed_mb": 360.25,
+    "compute_ersst_seconds": 3.12
+  }
+}

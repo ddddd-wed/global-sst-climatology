@@ -8,6 +8,7 @@ venv/
 data/raw/
 data/raw_global/
 data/raw_global_ice/
+data/raw_ersst/
 figures/*.png.tmp
 
 # IDE
