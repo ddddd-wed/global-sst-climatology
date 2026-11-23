@@ -767,9 +767,12 @@ def plot_indian_vs_global(ctx: dict, cov_min: float) -> Path:
     ok_diff = ok_old & np.isfinite(diff)
 
     fig = plt.figure(figsize=(11.8, 8.6))
-    gs = fig.add_gridspec(2, 1, height_ratios=[2.5, 1.0], hspace=0.08)
+    gs = fig.add_gridspec(2, 1, height_ratios=[2.5, 1.0], hspace=0.30)
     ax = fig.add_subplot(gs[0, 0])
     axd = fig.add_subplot(gs[1, 0], sharey=ax)
+    # 共享纬度竖轴：下方差值图不再重复显示纬度刻度，避免与主图 x 轴标签挤在一起
+    axd.tick_params(axis="y", labelleft=False)
+    axd.set_ylabel("")
 
     ax.plot(np.where(ok_glob, sst_glob, np.nan), lat_glob, color="#111111", lw=2.0, label="全球（90°S–90°N）")
     ax.plot(np.where(ok_old, sst_old, np.nan), lat_old, color="#E67E22", lw=2.2,
@@ -791,14 +794,13 @@ def plot_indian_vs_global(ctx: dict, cov_min: float) -> Path:
     axd.plot(np.where(ok_diff, diff, np.nan), lat_old, color="#7D3C98", lw=1.8)
     axd.fill_betweenx(lat_old, 0, np.where(ok_diff, diff, np.nan), color="#BB8FCE", alpha=0.3, lw=0)
     axd.set_xlabel("差值（°C）", fontsize=9)
-    axd.set_ylabel("纬度", fontsize=9)
     diff_abs = np.nanmax(np.abs(diff[ok_diff])) if ok_diff.any() else 0.5
     lim = max(0.5, 1.15 * float(diff_abs))
     axd.set_xlim(-lim, lim)
     axd.tick_params(axis="x", labelsize=9)
     axd.grid(True, ls=":", lw=0.8, alpha=0.55)
     axd.set_axisbelow(True)
-    axd.set_title("印度洋 − 全球（重叠纬度，正值 = 印度洋更暖）", fontsize=9.5, pad=4)
+    axd.set_title("印度洋 − 全球（重叠纬度，正值 = 印度洋更暖）", fontsize=9.5, pad=8, loc="left")
 
     fig.text(
         0.01,
