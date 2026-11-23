@@ -1,17 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""按月下载印度洋区域的 NOAA OISST v2.1 原始数据。
+"""按月下载 NOAA OISST v2.1 原始数据（支持 global 与 indian_ocean 预设）。
 
-- 每个时次对应的原始 CSV 以 gzip 无损压缩保存到 data/raw/（约 5 MB/月，压缩后约 2.5 MB）。
-  60 个时次的未压缩 CSV 合计约 300 MB，压缩后约 150 MB，满足 "原始 CSV 总量 <= 300 MB" 的约束，
-  且数据本身未做任何降采样、重采样或平滑。
-- 已存在的文件默认跳过，--force 强制重新下载。
-- 下载成功后校验表头、行数与时间戳，避免把 ERDDAP 的错误页当成数据缓存下来。
+- 请求头携带 Accept-Encoding: gzip 压低网络传输体积，流式解压后校验完整性再以 gzip 无损落盘。
+- 支持断点续传（已存在且通过基础校验的文件自动跳过）、--force 强制重下、指数退避重试。
+- 下载完成后写入 manifest.json，记录各文件时次、原始 CSV 字节数、gzip 落盘字节数与耗时。
 
 用法：
-    python scripts/fetch_data.py            # 断点续传，已存在则跳过
-    python scripts/fetch_data.py --force    # 全部重新下载
-    python scripts/fetch_data.py --jobs 1   # 串行下载（默认 4 并发）
+    python scripts/fetch_data.py                        # 默认下载 global 60 时次
+    python scripts/fetch_data.py --region indian_ocean  # 下载旧版印度洋区域
+    python scripts/fetch_data.py --force --jobs 4       # 强制重下，4 并发
 """
 
 from __future__ import annotations
@@ -30,14 +28,7 @@ from urllib.request import Request, urlopen
 from config import (
     BASE_URL,
     DATASET_ID,
-    EXPECTED_LINES,
-    LAT_MAX,
-    LAT_MIN,
-    LON_MAX,
-    LON_MIN,
-    N_LAT,
-    N_LON,
-    RAW_DIR,
+    REGION_PRESETS,
     SAMPLE_DAY,
     SAMPLE_HOUR,
     YEAR_END,
@@ -45,174 +36,223 @@ from config import (
 )
 
 
-def build_url(year: int, month: int) -> str:
+def build_url(year: int, month: int, preset: dict) -> str:
     """构造 ERDDAP griddap CSV 请求（原生 0.25° 网格，不设 stride）。"""
     ts = f"{year}-{month:02d}-{SAMPLE_DAY:02d}T{SAMPLE_HOUR:02d}:00:00Z"
     query = (
         f"sst[({ts}):1:({ts})]"
         f"[(0.0):1:(0.0)]"
-        f"[({LAT_MIN:.1f}):1:({LAT_MAX:.1f})]"
-        f"[({LON_MIN:.1f}):1:({LON_MAX:.1f})]"
+        f"[({preset['query_lat_min']}):1:({preset['query_lat_max']})]"
+        f"[({preset['query_lon_min']}):1:({preset['query_lon_max']})]"
     )
-    # 只保留 :(),.+- 不编码，方括号会被编码为 %5B/%5D
     return BASE_URL + "?" + quote(query, safe=":(),.+-=")
 
 
-def validate(payload: bytes, year: int, month: int) -> None:
-    """校验下载内容确实是完整的 281x401 原始 CSV。"""
+def validate(payload: bytes, year: int, month: int, preset: dict) -> None:
+    """校验下载内容表头、行数、时间戳及起止坐标点。"""
     if not payload.startswith(b"time,zlev,latitude,longitude,sst"):
         head = payload[:300].decode("utf-8", "replace")
         raise ValueError(f"响应表头异常: {head!r}")
+
+    expected_lines = preset["expected_lines"]
     n_lines = payload.count(b"\n")
-    if n_lines not in (EXPECTED_LINES - 1, EXPECTED_LINES):
-        raise ValueError(f"数据行数异常: {n_lines}（期望 {EXPECTED_LINES}）")
+    if n_lines not in (expected_lines - 1, expected_lines):
+        raise ValueError(f"数据行数异常: {n_lines}（期望 {expected_lines}）")
+
     stamp = f"{year}-{month:02d}-{SAMPLE_DAY:02d}T{SAMPLE_HOUR:02d}:00:00Z".encode()
     if stamp not in payload[:500]:
         raise ValueError(f"响应时间戳与请求不符: 期望 {stamp!r}")
 
+    tail = payload[-200:].strip()
+    last_line = tail.splitlines()[-1] if tail else b""
+    if not last_line.startswith(stamp):
+        raise ValueError(f"末尾行时间戳异常: {last_line!r}")
 
-def fetch_one(year: int, month: int, force: bool = False) -> tuple[str, Path, int, int]:
-    """下载单个时次，返回 (状态, 路径, 压缩后字节数, 原始字节数)。"""
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-    dest = RAW_DIR / f"sst_{year}_{month:02d}.csv.gz"
-    if dest.exists() and not force and dest.stat().st_size > 100_000:
-        return "skip", dest, dest.stat().st_size, 0
 
-    url = build_url(year, month)
+def is_valid_cached_file(path: Path, year: int, month: int, preset: dict) -> tuple[bool, int]:
+    """检查本地 gzip 缓存是否完整有效，返回 (是否有效, 解压后字节数)。"""
+    if not path.exists() or path.stat().st_size < 100_000:
+        return False, 0
+    try:
+        with gzip.open(path, "rb") as fh:
+            payload = fh.read()
+        validate(payload, year, month, preset)
+        return True, len(payload)
+    except Exception:  # noqa: BLE001 - 缓存损坏时视为无效并触发重下
+        return False, 0
+
+
+def fetch_one(year: int, month: int, preset: dict, force: bool = False) -> tuple[str, Path, int, int, float]:
+    """下载单个时次，返回 (状态, 路径, 压缩字节数, 解压字节数, 耗时秒)。"""
+    raw_dir: Path = preset["raw_dir"]
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    dest = raw_dir / f"sst_{year}_{month:02d}.csv.gz"
+
+    t0 = time.time()
+    if not force:
+        ok, raw_len = is_valid_cached_file(dest, year, month, preset)
+        if ok:
+            return "skip", dest, dest.stat().st_size, raw_len, time.time() - t0
+
+    url = build_url(year, month, preset)
     last_err: Exception | None = None
-    for attempt in range(1, 4):
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
         try:
             req = Request(
                 url,
-                headers={"User-Agent": "indian-ocean-sst/1.0 (python-urllib; research)"},
+                headers={
+                    "Accept-Encoding": "gzip",
+                    "User-Agent": "global-ocean-sst/1.0 (python-urllib; research)",
+                },
             )
             with urlopen(req, timeout=180) as resp:
-                payload = resp.read()
-            validate(payload, year, month)
+                chunks: list[bytes] = []
+                while True:
+                    chunk = resp.read(1024 * 256)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                wire = b"".join(chunks)
+                enc = (resp.headers.get("Content-Encoding") or "").lower()
+            payload = gzip.decompress(wire) if "gzip" in enc else wire
+            validate(payload, year, month, preset)
             packed = gzip.compress(payload, compresslevel=6, mtime=0)
             tmp = dest.with_name(dest.name + ".tmp")
             tmp.write_bytes(packed)
             tmp.replace(dest)
-            return "ok", dest, len(packed), len(payload)
-        except Exception as exc:  # noqa: BLE001 - 下载失败需要重试
+            return "ok", dest, len(packed), len(payload), time.time() - t0
+        except Exception as exc:  # noqa: BLE001 - 下载失败需指数退避重试
             last_err = exc
-            wait = 3 * attempt
-            print(f"  [重试 {attempt}/3] {year}-{month:02d}: {exc}（{wait}s 后重试）", flush=True)
-            time.sleep(wait)
+            if attempt < max_attempts:
+                wait = min(3 * (2 ** (attempt - 1)), 30)
+                print(f"  [重试 {attempt}/{max_attempts}] {year}-{month:02d}: {exc}（{wait}s 后重试）", flush=True)
+                time.sleep(wait)
     raise RuntimeError(f"{year}-{month:02d} 下载失败: {last_err}")
 
 
-def write_manifest(files_info: list[dict]) -> None:
+def write_manifest(
+    preset: dict,
+    files_info: list[dict],
+    start_year: int,
+    end_year: int,
+    total_elapsed: float,
+) -> None:
+    raw_dir: Path = preset["raw_dir"]
     manifest = {
-        "dataset": "NOAA OISST v2.1 日平均海表温度（ncdcOisst21Agg）",
+        "dataset": f"NOAA OISST v2.1 日平均海表温度（{DATASET_ID}）",
+        "region_preset": preset["name"],
         "endpoint": BASE_URL,
-        "region": {"lon_min": LON_MIN, "lon_max": LON_MAX, "lat_min": LAT_MIN, "lat_max": LAT_MAX},
+        "region": {
+            "lon_min": preset["lon_min"],
+            "lon_max": preset["lon_max"],
+            "lat_min": preset["lat_min"],
+            "lat_max": preset["lat_max"],
+        },
         "native_grid": {
             "resolution_deg": 0.25,
-            "n_latitude": N_LAT,
-            "n_longitude": N_LON,
-            "latitude_centers": "-39.875 ~ 30.125（覆盖 -40 ~ 30）",
-            "longitude_convention": "0-360（本区 20.125-120.125°E）",
+            "n_latitude": preset["n_lat"],
+            "n_longitude": preset["n_lon"],
+            "expected_lines": preset["expected_lines"],
+            "longitude_convention": "0-360",
         },
-        "timestamps": f"{YEAR_START}-01-{SAMPLE_DAY:02d}T{SAMPLE_HOUR:02d}:00:00Z ~ "
-                      f"{YEAR_END}-12-{SAMPLE_DAY:02d}T{SAMPLE_HOUR:02d}:00:00Z，每月 1 个时次，共 60 个",
+        "timestamps": (
+            f"{start_year}-01-{SAMPLE_DAY:02d}T{SAMPLE_HOUR:02d}:00:00Z ~ "
+            f"{end_year}-12-{SAMPLE_DAY:02d}T{SAMPLE_HOUR:02d}:00:00Z，每月 1 个时次，共 {len(files_info)} 个"
+        ),
         "storage": "gzip 无损压缩 CSV（.csv.gz），未做任何降采样或重采样",
+        "total_bytes_gz": sum(d["bytes_gz"] for d in files_info),
+        "total_bytes_csv": sum(d["bytes_csv"] for d in files_info),
+        "total_elapsed_sec": round(total_elapsed, 2),
         "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "files": sorted(files_info, key=lambda d: (d["year"], d["month"])),
     }
-    path = RAW_DIR / "manifest.json"
+    path = raw_dir / "manifest.json"
     path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def csv_size(path: Path) -> int:
-    """原始（解压后）CSV 字节数，写进 manifest 便于核对体积。"""
-    if path.suffix == ".gz":
-        with gzip.open(path, "rb") as fh:
-            return len(fh.read())
-    return path.stat().st_size
-
-
 def main() -> int:
-    parser = argparse.ArgumentParser(description="下载印度洋 OISST v2.1 月度原始数据")
+    parser = argparse.ArgumentParser(description="下载 NOAA OISST v2.1 月度原始数据")
+    parser.add_argument(
+        "--region",
+        choices=tuple(REGION_PRESETS),
+        default="global",
+        help="区域预设：global（默认）或 indian_ocean",
+    )
     parser.add_argument("--force", action="store_true", help="忽略已有缓存，强制重新下载")
     parser.add_argument("--jobs", type=int, default=4, help="并发下载数（默认 4）")
     parser.add_argument("--start-year", type=int, default=YEAR_START)
     parser.add_argument("--end-year", type=int, default=YEAR_END)
     args = parser.parse_args()
 
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    preset = REGION_PRESETS[args.region]
+    raw_dir: Path = preset["raw_dir"]
+    raw_dir.mkdir(parents=True, exist_ok=True)
     tasks = [(y, m) for y in range(args.start_year, args.end_year + 1) for m in range(1, 13)]
-    total_packed = 0
-    total_raw = 0
+
     done = 0
+    new_raw_bytes = 0
     failed: list[tuple[int, int, str]] = []
     files_info: list[dict] = []
     t0 = time.time()
 
-    print(f"开始下载 {len(tasks)} 个时次 -> {RAW_DIR}（并发 {args.jobs}）", flush=True)
+    print(
+        f"[{preset['name']}] 开始下载 {len(tasks)} 个时次 -> {raw_dir}（并发 {args.jobs}）",
+        flush=True,
+    )
+
+    def handle_result(y: int, m: int, status: str, path: Path, packed: int, raw: int, sec: float) -> None:
+        nonlocal done, new_raw_bytes
+        done += 1
+        if status == "ok":
+            new_raw_bytes += raw
+            print(f"  [{done:02d}/{len(tasks)}] 下载 {path.name}  {packed/1e6:.2f} MB (csv {raw/1e6:.2f} MB, {sec:.1f}s)", flush=True)
+        else:
+            print(f"  [{done:02d}/{len(tasks)}] 跳过 {path.name}（已校验缓存，{packed/1e6:.2f} MB）", flush=True)
+        files_info.append(
+            {
+                "file": path.name,
+                "year": y,
+                "month": m,
+                "bytes_gz": packed,
+                "bytes_csv": raw,
+                "elapsed_sec": round(sec, 2),
+                "status": status,
+            }
+        )
+
     if args.jobs <= 1:
         for y, m in tasks:
             try:
-                status, path, packed, raw = fetch_one(y, m, args.force)
+                res = fetch_one(y, m, preset, args.force)
+                handle_result(y, m, *res)
             except Exception as exc:  # noqa: BLE001
                 failed.append((y, m, str(exc)))
                 print(f"  [失败] {y}-{m:02d}: {exc}", flush=True)
-                continue
-            done += 1
-            if status == "ok":
-                total_packed += packed
-                total_raw += raw
-                print(f"  [{done:02d}/{len(tasks)}] 下载 {path.name}  {packed/1e6:.2f} MB", flush=True)
-            else:
-                total_packed += packed
-                print(f"  [{done:02d}/{len(tasks)}] 跳过 {path.name}（已存在）", flush=True)
-            files_info.append({"file": path.name, "year": y, "month": m, "bytes_gz": packed})
     else:
         with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-            futures = {pool.submit(fetch_one, y, m, args.force): (y, m) for y, m in tasks}
+            futures = {pool.submit(fetch_one, y, m, preset, args.force): (y, m) for y, m in tasks}
             for fut in as_completed(futures):
                 y, m = futures[fut]
                 try:
-                    status, path, packed, raw = fut.result()
+                    res = fut.result()
+                    handle_result(y, m, *res)
                 except Exception as exc:  # noqa: BLE001
                     failed.append((y, m, str(exc)))
                     print(f"  [失败] {y}-{m:02d}: {exc}", flush=True)
-                    continue
-                done += 1
-                total_packed += packed
-                if status == "ok":
-                    total_raw += raw
-                    print(f"  [{done:02d}/{len(tasks)}] 下载 {path.name}  {packed/1e6:.2f} MB", flush=True)
-                else:
-                    print(f"  [{done:02d}/{len(tasks)}] 跳过 {path.name}（已存在）", flush=True)
-                files_info.append({"file": path.name, "year": y, "month": m, "bytes_gz": packed})
-
-    # 清单只保留磁盘上实际存在的文件
-    existing = sorted(RAW_DIR.glob("sst_*.csv.gz"))
-    if len(existing) == len(tasks):
-        files_info = []
-        for path in existing:
-            _, year_s, month_s = path.name.split(".")[0].split("_")
-            files_info.append(
-                {
-                    "file": path.name,
-                    "year": int(year_s),
-                    "month": int(month_s),
-                    "bytes_gz": path.stat().st_size,
-                    "bytes_csv": csv_size(path),
-                }
-            )
-        write_manifest(files_info)
-    else:
-        print(f"注意：仅 {len(existing)}/{len(tasks)} 个文件就绪，未写入 manifest。", flush=True)
 
     elapsed = time.time() - t0
-    total_disk = sum(p.stat().st_size for p in existing)
-    total_csv = sum(csv_size(p) for p in existing) if existing else 0
+    if not failed and len(files_info) == len(tasks):
+        write_manifest(preset, files_info, args.start_year, args.end_year, elapsed)
+    else:
+        print(f"注意：仅 {len(files_info)}/{len(tasks)} 个文件就绪，未写入 manifest。", flush=True)
+
+    total_gz = sum(d["bytes_gz"] for d in files_info)
+    total_csv = sum(d["bytes_csv"] for d in files_info)
     print(
-        f"\n完成：{done} 个时次，失败 {len(failed)} 个，用时 {elapsed:.1f}s；"
-        f"本次新下载原始 CSV {total_raw/1e6:.1f} MB（未压缩），"
-        f"data/raw 共 {len(existing)} 个文件 / {total_disk/1e6:.1f} MB（gzip，原始 CSV {total_csv/1e6:.1f} MB）。",
+        f"\n完成：{done}/{len(tasks)} 个时次，失败 {len(failed)} 个，用时 {elapsed:.1f}s；"
+        f"本次新下载原始 CSV {new_raw_bytes/1e6:.1f} MB；"
+        f"{raw_dir.name} 共 {len(files_info)} 个文件 / {total_gz/1e6:.1f} MB（gzip，解压 {total_csv/1e6:.1f} MB）。",
         flush=True,
     )
     if failed:

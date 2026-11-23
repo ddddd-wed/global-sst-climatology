@@ -6,6 +6,7 @@ venv/
 
 # 数据与产物
 data/raw/
+data/raw_global/
 figures/*.png.tmp
 
 # IDE
