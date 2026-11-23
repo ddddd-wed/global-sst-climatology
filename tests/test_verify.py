@@ -232,5 +232,67 @@ class TestStructuralChecks(unittest.TestCase):
         self.assertIn("coverage", result["detail"])
 
 
+class TestBasinLatitudeAlignment(unittest.TestCase):
+    """basins 文件只输出 ocean_grid_count>0 的纬度，校验必须按 latitude 对齐而不是按位置。"""
+
+    @staticmethod
+    def _frames() -> tuple[pd.DataFrame, pd.DataFrame]:
+        global_df = TestStructuralChecks._new_frame()
+        drop = [0, 1, 2]  # 模拟高南纬无海洋格点、basins 中不输出的行
+        for col in ("sst_annual", "sst_jan", "sst_jul"):
+            global_df.loc[drop, col] = np.nan
+        global_df.loc[drop, "ocean_grid_count"] = 0
+        global_df.loc[drop, "valid_count"] = 0
+        global_df.loc[drop, "coverage"] = 0.0
+        global_df.loc[drop, "zonal_ocean_frac"] = 0.0
+        for m in range(1, 13):
+            global_df.loc[drop, f"sst_{m:02d}"] = np.nan
+            global_df.loc[drop, f"cov_{m:02d}"] = 0.0
+
+        basin_rows = global_df.drop(index=drop).reset_index(drop=True)
+        frames = []
+        for name in ("global", "pacific", "atlantic", "indian", "arctic", "southern"):
+            part = basin_rows.copy()
+            part.insert(0, "basin", name)
+            frames.append(part)
+        return global_df, pd.concat(frames, ignore_index=True)
+
+    def _write(self, tag: str) -> tuple[Path, Path, pd.DataFrame]:
+        global_df, basins = self._frames()
+        root = scratch_dir(tag)
+        gpath, bpath = root / "zonal_mean_global.csv", root / "zonal_mean_basins.csv"
+        global_df.to_csv(gpath, index=False)
+        basins.to_csv(bpath, index=False)
+        return gpath, bpath, global_df
+
+    def test_missing_rows_allowed_when_ocean_count_zero(self) -> None:
+        gpath, bpath, global_df = self._write("align_pass")
+        result = verify.check_basins_zonal(bpath, pd.read_csv(gpath))
+        self.assertEqual(result["status"], "pass", result["detail"])
+        self.assertEqual(result["metrics"]["basins"]["global"]["missing_in_basins"], 3)
+
+    def test_missing_row_with_ocean_fails(self) -> None:
+        gpath, bpath, global_df = self._write("align_fail")
+        g = pd.read_csv(gpath)
+        g.loc[0, "ocean_grid_count"] = 2  # 该纬度有海洋格点，basins 不应缺行
+        g.to_csv(gpath, index=False)
+        result = verify.check_basins_zonal(bpath, g)
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("ocean_grid_count != 0", result["detail"])
+
+
+class TestGridMonthlyOptional(unittest.TestCase):
+    def test_grid_without_monthly_keys_passes(self) -> None:
+        df = TestStructuralChecks._new_frame()
+        lat = df["latitude"].to_numpy(dtype=float)
+        lon = np.round(0.125 + 0.25 * np.arange(verify.N_LON_GLOBAL), 3)
+        annual = np.repeat(df["sst_annual"].to_numpy(dtype=float)[:, None], len(lon), axis=1)
+        path = scratch_dir("grid_nomonth") / "climatology_grid.npz"
+        np.savez_compressed(path, lat=lat, lon=lon, sst_annual=annual)
+        result = verify.check_grid(path, df)
+        self.assertEqual(result["status"], "pass", result["detail"])
+        self.assertEqual(result["metrics"]["monthly_keys_present"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,26 +4,29 @@
 
 复核内容
 --------
-1. **数值复算**：读取 ``data/raw/`` 下 60 个 ``sst_YYYY_MM.csv.gz``，独立重算纬向平均，
-   抽 8 个纬度 × 1 月/7 月两个月份，与 ``zonal_mean_basins.csv`` 的 global 行对齐到 0.01 °C。
+1. **数值复算**：读取 ``data/raw/``（或 ``--raw-dir``）下 60 个 ``sst_YYYY_MM.csv.gz``，独立重算纬向平均，
+   抽 8 个纬度 × 1 月/7 月两个月份，与 ``zonal_mean_basins.csv`` 的 global 行**按纬度**对齐到 0.01 °C；
+   统计域用 ``basin_mask.npz::basin_mask`` 剔除内陆湖泊（SST 均值仍独立计算）。
 2. **结构性检查**：720 行、0.25° 步长、纬度单调，``coverage = valid_count/ocean_grid_count``、
    ``zonal_ocean_frac = valid_count/1440``、``cov_MM`` 与 ``sst_MM`` 的 NaN 模式（均容差 0.002）、
-   海洋值不越界、1 月/7 月南北半球季节反相；新列缺失时自动退回旧口径（coverage≈valid/1440）。
-3. **网格一致性**：``climatology_grid.npz`` 形状/键齐全，且在"有效格点全覆盖"的纬度上其纬向平均
-   与 CSV 一致（避免冰缘处"先平均后加权"的固有差异被误判）。
+   海洋值不越界、1 月/7 月南北半球季节反相；新列/月度列缺失时自动退回旧口径或跳过。
+   分海盆文件只输出 ``ocean_grid_count > 0`` 的纬度行，校验按 ``latitude`` 交集比对，并正向断言
+   缺失行在 global CSV 中必须 ``ocean_grid_count == 0``（反之亦然）。
+3. **网格一致性**：``climatology_grid.npz`` 至少含 lat/lon/sst_annual，月度键按需；在"有效格点全覆盖"
+   的纬度上比较网格纬向平均与 CSV（比对前按 basin_mask 剔除内陆湖泊）。
 4. **在线抽样**：直接向 ERDDAP 取 2–3 个时次 × 一条约 1° 宽的纬度带（很小的请求），
    与本地同一时次的 ``data/raw/`` 逐纬圈比对，容差 0.05 °C；网络不通时**跳过**，不算失败。
 5. **印度洋回归**：用仓库已提交的 ``data/zonal_mean.csv``（281 行）复算 README 现值
    （最高 29.14 °C @ 2.12°N、25 °C 等温线 21.66°S、海盆均值 26.16 °C），证明全球版没有改口径。
 
-结果写入 ``data/verify_report.json``（fixture 模式写到对应目录），并打印结论。
+结果写入 ``data/verify_report.json``（或 ``--report`` 指定路径），并打印结论。
 任何一项**实际比对失败**都会非零退出；因数据未就绪或网络不通而跳过的不算失败。
 
 用法::
 
     python scripts/verify.py
-    python scripts/verify.py --data-dir .tmp/fixture          # 复核合成 fixture
-    python scripts/verify.py --skip-online                    # 不联网
+    python scripts/verify.py --data-dir .tmp/fixture --skip-online   # 复核合成 fixture
+    python scripts/verify.py --data-dir <数据目录> --raw-dir <raw目录> --report .tmp/x.json --skip-online
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ import io
 import json
 import re
 import sys
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -64,6 +68,9 @@ REQUIRED_COLUMNS = (
     ["latitude", "valid_count", "coverage", "sst_annual", "sst_jan", "sst_jul"]
     + [f"sst_{m:02d}" for m in range(1, 13)]
 )
+CORE_COLUMNS = ["latitude", "valid_count", "coverage", "sst_annual", "sst_jan", "sst_jul"]
+SST_COLUMNS = ["sst_annual", "sst_jan", "sst_jul"] + [f"sst_{m:02d}" for m in range(1, 13)]
+MONTHLY_COLUMNS = [f"sst_{m:02d}" for m in range(1, 13)]
 ERDDAP_BASE = "https://coastwatch.pfeg.noaa.gov/erddap/griddap/ncdcOisst21Agg.csv"
 INDIAN_BASELINE = {
     "sst_max": (29.14, 0.01),
@@ -148,6 +155,27 @@ def read_raw_csv(path: Path) -> pd.DataFrame:
     )
 
 
+def load_ocean_mask(data_dir: Path) -> tuple[np.ndarray | None, str]:
+    """读取数据侧的海盆/海洋掩膜（basin_mask>0），用于把内陆湖泊从纬向平均域中剔除。
+
+    这是**定义域**，不是 SST 数值；SST 的纬向平均仍由 verify.py 从 raw 独立计算。
+    缺失时返回 (None, "none")，校验会退化为使用全部有效格点。
+    """
+    for name in ("basin_mask.npz", "climatology_grid.npz"):
+        path = data_dir / name
+        if not path.exists():
+            continue
+        try:
+            with np.load(path) as npz:
+                if "basin_mask" in npz.files:
+                    mask = npz["basin_mask"].astype(np.uint8) > 0
+                    if mask.shape == (N_LAT_GLOBAL, N_LON_GLOBAL):
+                        return mask, f"{name}::basin_mask"
+        except Exception:  # noqa: BLE001
+            continue
+    return None, "none"
+
+
 # --------------------------------------------------------------------------- #
 # 1. 全球纬向平均 CSV
 # --------------------------------------------------------------------------- #
@@ -208,6 +236,12 @@ def coverage_consistency(frame: pd.DataFrame, label: str) -> tuple[list[str], di
 
     checked = 0
     mismatched: list[str] = []
+    # 无海洋格点（ocean_grid_count=0）的行允许 cov=0 而 sst=NaN；有海洋格点的行必须同 NaN 模式
+    row_mask = (
+        frame["ocean_grid_count"].to_numpy(dtype=float) > 0
+        if "ocean_grid_count" in frame
+        else np.ones(len(frame), dtype=bool)
+    )
     for m in range(1, 13):
         cov_col = f"cov_{m:02d}"
         sst_col = f"sst_{m:02d}"
@@ -216,7 +250,7 @@ def coverage_consistency(frame: pd.DataFrame, label: str) -> tuple[list[str], di
         checked += 1
         cov_nan = np.isnan(frame[cov_col].to_numpy(dtype=float))
         sst_nan = np.isnan(frame[sst_col].to_numpy(dtype=float))
-        if not np.array_equal(cov_nan, sst_nan):
+        if not np.array_equal(cov_nan[row_mask], sst_nan[row_mask]):
             mismatched.append(f"cov_{m:02d}/sst_{m:02d}")
     if 0 < checked < 12:
         problems.append(f"{label}: cov_MM 列不完整（只有 {checked}/12 个月）")
@@ -236,13 +270,12 @@ def check_global_zonal(path: Path) -> dict:
         return make_check(name, "fail", f"无法读取 {path}：{exc}")
     if df.empty:
         return make_check(name, "fail", "文件为空", {"rows": 0})
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    missing = [c for c in CORE_COLUMNS if c not in df.columns]
     if missing:
         return make_check(name, "fail", f"缺少必需列：{missing}")
     problems: list[str] = []
+    monthly_present = [c for c in MONTHLY_COLUMNS if c in df.columns]
 
-    if list(df.columns[:18]) != REQUIRED_COLUMNS:
-        problems.append(f"前 18 列与契约不符：{list(df.columns[:18])}")
     if len(df) != N_LAT_GLOBAL:
         problems.append(f"行数 {len(df)} != {N_LAT_GLOBAL}")
 
@@ -269,7 +302,9 @@ def check_global_zonal(path: Path) -> dict:
 
     ocean_max = -np.inf
     ocean_min = np.inf
-    for col in REQUIRED_COLUMNS[3:]:
+    for col in SST_COLUMNS:
+        if col not in df:
+            continue
         values = df[col].to_numpy(dtype=float)
         finite = values[np.isfinite(values)]
         if finite.size:
@@ -297,6 +332,7 @@ def check_global_zonal(path: Path) -> dict:
         "lat_last": float(lat[-1]),
         "sst_min": ocean_min,
         "sst_max": ocean_max,
+        "monthly_columns_present": len(monthly_present),
         "nh_jan_minus_jul": nh_jan - nh_jul,
         "sh_jan_minus_jul": sh_jan - sh_jul,
         **cov_info,
@@ -345,31 +381,45 @@ def check_basins_zonal(path: Path, global_df: pd.DataFrame | None) -> dict:
     if set(expected_order) - set(seen):
         problems.append(f"缺少海盆：{sorted(set(expected_order) - set(seen))}")
 
-    lat_ref = global_df["latitude"].to_numpy(dtype=float) if global_df is not None else None
+    global_lats = (
+        np.round(global_df["latitude"].to_numpy(dtype=float), 3) if global_df is not None else None
+    )
+    global_ocean = (
+        dict(zip(global_lats, global_df["ocean_grid_count"].to_numpy(dtype=float)))
+        if global_df is not None and "ocean_grid_count" in global_df
+        else None
+    )
+
     for basin, group in df.groupby(basin_col, sort=False):
         group = group.reset_index(drop=True)
         info: dict[str, Any] = {"rows": len(group)}
         metrics["basins"][str(basin)] = info
-        if list(group.columns[1:19]) != REQUIRED_COLUMNS:
-            problems.append(f"{basin}: 首列之后前 18 列与契约不符")
-        missing = [c for c in REQUIRED_COLUMNS if c not in group.columns]
+        missing = [c for c in CORE_COLUMNS if c not in group.columns]
         if missing:
             problems.append(f"{basin}: 缺少必需列 {missing}")
             continue
-        if len(group) != N_LAT_GLOBAL:
-            problems.append(f"{basin}: 行数 {len(group)} != {N_LAT_GLOBAL}")
+        if group.empty:
+            problems.append(f"{basin}: 没有数据行")
             continue
         lat = group["latitude"].to_numpy(dtype=float)
-        if lat_ref is not None and not np.allclose(lat, lat_ref, atol=1e-9):
-            problems.append(f"{basin}: 纬度网格与全球文件不一致")
-        if not np.all(np.diff(lat) > 0) or not np.allclose(np.diff(lat), LAT_STEP, atol=1e-9):
-            problems.append(f"{basin}: 纬度不是 0.25° 单调网格")
+        info["lat_min"] = float(lat.min())
+        info["lat_max"] = float(lat.max())
+        if not np.all(np.diff(lat) > 0):
+            problems.append(f"{basin}: 纬度不是严格递增")
+        elif not np.allclose(np.diff(lat) / LAT_STEP, np.round(np.diff(lat) / LAT_STEP), atol=1e-9):
+            problems.append(f"{basin}: 纬度不是 0.25° 的整数倍（允许缺行）")
+        if global_lats is not None:
+            outside = np.setdiff1d(np.round(lat, 3), global_lats)
+            if outside.size:
+                problems.append(f"{basin}: {outside.size} 个纬度不在全球网格上（如 {outside[:3]}）")
 
         cov_problems, cov_info = coverage_consistency(group, str(basin))
         problems += cov_problems
         info.update(cov_info)
 
-        for col in REQUIRED_COLUMNS[3:]:
+        for col in SST_COLUMNS:
+            if col not in group:
+                continue
             values = group[col].to_numpy(dtype=float)
             finite = values[np.isfinite(values)]
             if finite.size and (finite.max() > SST_MAX or finite.min() < SST_MIN):
@@ -380,23 +430,75 @@ def check_basins_zonal(path: Path, global_df: pd.DataFrame | None) -> dict:
         problems.append("缺少 global 海盆行")
     elif global_df is not None:
         g = df[df[basin_col] == "global"].reset_index(drop=True)
-        for col in ("sst_annual", "sst_jan", "sst_jul", "coverage"):
-            a = g[col].to_numpy(dtype=float)
-            b = global_df[col].to_numpy(dtype=float)
-            mask = np.isfinite(a) & np.isfinite(b)
-            diff = float(np.max(np.abs(a[mask] - b[mask]))) if mask.any() else float("nan")
-            metrics["basins"]["global"][f"max_diff_vs_global_{col}"] = diff
-            if not np.isfinite(diff) or diff > 0.002:
-                problems.append(f"global 行 {col} 与全球文件最大偏差 {diff:.5f} > 0.002")
+        g_lat = np.round(g["latitude"].to_numpy(dtype=float), 3)
+        common, ia, ib = np.intersect1d(global_lats, g_lat, return_indices=True)
+        metrics["basins"]["global"]["common_latitudes"] = int(common.size)
+        if common.size == 0:
+            problems.append("global 行与全球 CSV 没有公共纬度")
+        compare_cols = [
+            c
+            for c in g.columns
+            if c not in (basin_col, "latitude")
+            and c in global_df.columns
+            and pd.api.types.is_numeric_dtype(g[c])
+            and pd.api.types.is_numeric_dtype(global_df[c])
+        ]
+        worst: dict[str, float] = {}
+        for col in compare_cols:
+            a = global_df[col].to_numpy(dtype=float)[ia]
+            b = g[col].to_numpy(dtype=float)[ib]
+            if np.any(np.isnan(a) != np.isnan(b)):
+                problems.append(f"global 行 {col} 与全球 CSV 在公共纬度上 NaN 模式不一致")
+                continue
+            finite = np.isfinite(a) & np.isfinite(b)
+            if not finite.any():
+                continue
+            diff = float(np.max(np.abs(a[finite] - b[finite])))
+            worst[col] = diff
+            # 计数类容差放宽；温度/比例列按 0.002（原口径）
+            tol = 0.05 if col == "valid_count" else (1e-9 if col == "ocean_grid_count" else 0.002)
+            if diff > tol:
+                problems.append(f"global 行 {col} 与全球 CSV 最大偏差 {diff:.5f} > {tol}")
+        metrics["basins"]["global"]["max_diff"] = worst
+
+        # 正向断言：global CSV 有、basin=global 无的纬度，必须是 ocean_grid_count == 0
+        missing_lats = np.setdiff1d(global_lats, g_lat)
+        metrics["basins"]["global"]["missing_in_basins"] = int(missing_lats.size)
+        if missing_lats.size:
+            if global_ocean is not None:
+                bad = [float(x) for x in missing_lats if global_ocean.get(float(x), np.nan) != 0]
+                if bad:
+                    problems.append(
+                        f"global CSV 有 {len(missing_lats)} 个纬度不在 basin=global 中，"
+                        f"其中 {len(bad)} 个 ocean_grid_count != 0（如 {bad[:3]}）"
+                    )
+            else:
+                metrics["basins"]["global"]["missing_assertion"] = "skipped（全球 CSV 无 ocean_grid_count 列）"
+        # 反之亦然：basin=global 有、global CSV 无的纬度，必须是 ocean_grid_count == 0
+        extra_lats = np.setdiff1d(g_lat, global_lats)
+        metrics["basins"]["global"]["extra_in_basins"] = int(extra_lats.size)
+        if extra_lats.size:
+            if "ocean_grid_count" in g:
+                ocean_map = dict(zip(g_lat, g["ocean_grid_count"].to_numpy(dtype=float)))
+                bad = [float(x) for x in extra_lats if ocean_map.get(float(x), np.nan) != 0]
+                if bad:
+                    problems.append(
+                        f"basin=global 有 {len(extra_lats)} 个纬度不在全球 CSV 中，"
+                        f"其中 {len(bad)} 个 ocean_grid_count != 0（如 {bad[:3]}）"
+                    )
+            else:
+                metrics["basins"]["global"]["extra_assertion"] = "skipped（basin 无 ocean_grid_count 列）"
 
     if problems:
-        return make_check(name, "fail", "；".join(problems), metrics)
+        return make_check(name, "fail", "；".join(problems[:10]), metrics)
     return make_check(
         name,
         "pass",
-        f"{len(metrics['basins'])} 个海盆 × {N_LAT_GLOBAL} 行；coverage 分母 "
+        f"{len(metrics['basins'])} 个海盆（行数 "
+        + "/".join(f"{b}:{info['rows']}" for b, info in metrics["basins"].items())
+        + "），按纬度与全球 CSV 对齐；coverage 分母 "
         f"{metrics['basins'].get('global', {}).get('coverage_denominator', '?')}，"
-        "coverage/zonal_ocean_frac/cov_MM 自洽，global 行与全球文件一致",
+        "coverage/zonal_ocean_frac/cov_MM 自洽，缺失纬度均为 ocean_grid_count=0",
         metrics,
     )
 
@@ -404,26 +506,54 @@ def check_basins_zonal(path: Path, global_df: pd.DataFrame | None) -> dict:
 # --------------------------------------------------------------------------- #
 # 3. 气候态网格
 # --------------------------------------------------------------------------- #
-def check_grid(path: Path, global_df: pd.DataFrame | None) -> dict:
+def check_grid(
+    path: Path,
+    global_df: pd.DataFrame | None,
+    ocean_mask: np.ndarray | None = None,
+) -> dict:
     name = "climatology_grid.npz 一致性"
     if not path.exists():
         return make_check(name, "fail", f"缺少 {path}")
-    required = {"lat", "lon", "sst_annual"} | {f"sst_{m:02d}" for m in range(1, 13)}
+    mask_source = "external" if ocean_mask is not None else "none"
     try:
         with np.load(path) as npz:
             keys = set(npz.files)
-            missing = required - keys
-            if missing:
-                return make_check(name, "fail", f"缺少键：{sorted(missing)}")
-            lat = npz["lat"].astype(float)
-            lon = npz["lon"].astype(float)
+            if "sst_annual" not in keys:
+                return make_check(name, "fail", "缺少键：sst_annual")
+            if "lat" in keys:
+                lat = npz["lat"].astype(float)
+            elif "latitude" in keys:
+                lat = npz["latitude"].astype(float)
+            else:
+                return make_check(name, "fail", "缺少键：lat/latitude")
+            if "lon" in keys:
+                lon = npz["lon"].astype(float)
+            elif "longitude" in keys:
+                lon = npz["longitude"].astype(float)
+            else:
+                return make_check(name, "fail", "缺少键：lon/longitude")
             annual = npz["sst_annual"].astype(float)
-            monthly = {m: npz[f"sst_{m:02d}"].astype(float) for m in range(1, 13)}
+            # 月度键按需检测：没有月键也能复核，热图会用 CSV 的月度列
+            monthly = {m: npz[f"sst_{m:02d}"].astype(float) for m in range(1, 13) if f"sst_{m:02d}" in keys}
+            extra_fields = {
+                key: npz[key].astype(float) for key in ("sst_jan", "sst_jul") if key in keys
+            }
+            if ocean_mask is None and "basin_mask" in keys:
+                candidate = npz["basin_mask"].astype(np.uint8) > 0
+                if candidate.shape == annual.shape:
+                    ocean_mask = candidate
+                    mask_source = "npz::basin_mask"
     except Exception as exc:  # noqa: BLE001
         return make_check(name, "fail", f"无法读取 {path}：{exc}")
 
     problems: list[str] = []
-    metrics: dict[str, Any] = {"keys": sorted(keys)}
+    metrics: dict[str, Any] = {
+        "keys": sorted(keys),
+        "monthly_keys_present": len(monthly),
+        "mask_source": mask_source,
+    }
+    if ocean_mask is not None and ocean_mask.shape != annual.shape:
+        problems.append(f"ocean_mask 形状 {ocean_mask.shape} != sst_annual {annual.shape}")
     if len(lat) != N_LAT_GLOBAL or len(lon) != N_LON_GLOBAL:
         problems.append(f"lat/lon 长度 {len(lat)}/{len(lon)} != 720/1440")
     if annual.shape != (len(lat), len(lon)):
@@ -457,13 +587,19 @@ def check_grid(path: Path, global_df: pd.DataFrame | None) -> dict:
             metrics["grid_check"] = "skipped（有效格点全覆盖纬度不足 5 个）"
         else:
             checks = {"sst_annual": (annual, global_df["sst_annual"].to_numpy(dtype=float))}
-            for m in (1, 4, 7, 10):
-                checks[f"sst_{m:02d}"] = (monthly[m], global_df[f"sst_{m:02d}"].to_numpy(dtype=float))
+            for key in ("sst_jan", "sst_jul"):
+                if key in extra_fields and key in global_df:
+                    checks[key] = (extra_fields[key], global_df[key].to_numpy(dtype=float))
+            for m, grid in monthly.items():
+                key = f"sst_{m:02d}"
+                if key in global_df:
+                    checks[key] = (grid, global_df[key].to_numpy(dtype=float))
             worst = 0.0
             worst_key = ""
             for key, (grid, csv) in checks.items():
+                grid_use = np.where(ocean_mask, grid, np.nan) if ocean_mask is not None else grid
                 with np.errstate(invalid="ignore"):
-                    grid_mean = np.nanmean(grid[full], axis=1)
+                    grid_mean = np.nanmean(grid_use[full], axis=1)
                 diff = float(np.nanmax(np.abs(grid_mean - csv[full])))
                 if not np.isfinite(diff):
                     problems.append(f"有效格点全覆盖纬度上 {key} 的网格纬向平均出现 NaN")
@@ -481,7 +617,7 @@ def check_grid(path: Path, global_df: pd.DataFrame | None) -> dict:
     return make_check(
         name,
         "pass",
-        f"{len(lat)}×{len(lon)} 网格，{len(monthly)} 个月 + 年均键齐全，"
+        f"{len(lat)}×{len(lon)} 网格，sst_annual + {len(monthly)} 个月度键（按需），"
         f"海洋格点占比 {metrics.get('ocean_fraction', float('nan')):.1%}，"
         f"有效格点全覆盖纬度 {metrics.get('full_ocean_latitudes', 0)} 个上纬向平均与 CSV 最大偏差 "
         f"{metrics.get('max_grid_zonal_diff', {}).get('value', float('nan')):.4f} °C",
@@ -503,39 +639,79 @@ def list_raw_files(raw_dir: Path) -> list[tuple[tuple[int, int], Path]]:
     return out
 
 
-def recompute_zonal_from_raw(files: list[tuple[tuple[int, int], Path]]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def recompute_zonal_from_raw(
+    files: list[tuple[tuple[int, int], Path]],
+    ocean_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """独立重算：逐时次纬向平均 -> 同月多年平均 -> 12 月等权年均。
 
+    ``ocean_mask`` 只用于定义统计域（剔除内陆湖泊/陆地），SST 均值仍在本函数内独立计算。
     返回 (lat, clim[12,nlat], annual[nlat], counts[ntime,nlat])。
     """
     lat_ref: np.ndarray | None = None
+    lon_ref: np.ndarray | None = None
+    n_lat = n_lon = 0
     means: dict[tuple[int, int], np.ndarray] = {}
     counts: dict[tuple[int, int], np.ndarray] = {}
-    for (year, month), path in files:
+    for i, ((year, month), path) in enumerate(files, start=1):
         df = read_raw_csv(path)
-        lats = np.sort(df["latitude"].unique())
+        lat_col = df["latitude"].to_numpy(dtype=float)
+        lon_col = df["longitude"].to_numpy(dtype=float)
+        sst_col = df["sst"].to_numpy(dtype=float)
         if lat_ref is None:
-            lat_ref = lats
-        elif not np.array_equal(lats, lat_ref):
-            raise ValueError(f"{path.name} 的纬度网格与首个文件不一致")
-        grouped = df.groupby("latitude", sort=True)["sst"]
-        means[(year, month)] = grouped.mean().reindex(lat_ref).to_numpy(dtype=float)
-        counts[(year, month)] = grouped.count().reindex(lat_ref).to_numpy(dtype=float)
+            lat_ref = np.unique(lat_col)
+            lon_ref = np.unique(lon_col)
+            n_lat, n_lon = len(lat_ref), len(lon_ref)
+            if n_lat * n_lon != len(df):
+                raise ValueError(f"{path.name} 行数 {len(df)} != {n_lat}×{n_lon}")
+            if ocean_mask is not None and ocean_mask.shape != (n_lat, n_lon):
+                raise ValueError(
+                    f"ocean_mask 形状 {ocean_mask.shape} 与 raw 网格 {(n_lat, n_lon)} 不一致"
+                )
+            expected_lat = np.repeat(lat_ref, n_lon)
+            expected_lon = np.tile(lon_ref, n_lat)
+        if len(df) != n_lat * n_lon:
+            raise ValueError(f"{path.name} 行数 {len(df)} != {n_lat}×{n_lon}")
+        if not (np.array_equal(lat_col, expected_lat) and np.array_equal(lon_col, expected_lon)):
+            raise ValueError(f"{path.name} 的经纬度行列顺序与标准网格不一致")
+
+        grid = sst_col.reshape(n_lat, n_lon)
+        valid = np.isfinite(grid)
+        if ocean_mask is not None:
+            valid &= ocean_mask
+        c = valid.sum(axis=1).astype(float)
+        s = np.where(valid, grid, 0.0).sum(axis=1)
+        zonal = np.full(n_lat, np.nan, dtype=float)
+        nonzero = c > 0
+        zonal[nonzero] = s[nonzero] / c[nonzero]
+        means[(year, month)] = zonal
+        counts[(year, month)] = c
+        if i % 10 == 0 or i == len(files):
+            print(f"  raw 重算 [{i:02d}/{len(files)}] {path.name}", flush=True)
+
     assert lat_ref is not None
     years = sorted({y for y, _ in means})
     months = sorted({m for _, m in means})
     if months != list(range(1, 13)):
         raise ValueError(f"月份不完整：{months}")
     clim = np.full((12, len(lat_ref)), np.nan, dtype=float)
-    for i, month in enumerate(range(1, 13)):
-        stack = np.vstack([means[(y, month)] for y in years])
-        clim[i] = np.nanmean(stack, axis=0)
-    annual = np.nanmean(clim, axis=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # 无海洋格点的纬度
+        for i, month in enumerate(range(1, 13)):
+            stack = np.vstack([means[(y, month)] for y in years])
+            clim[i] = np.nanmean(stack, axis=0)
+        annual = np.nanmean(clim, axis=0)
     count_stack = np.vstack([counts[key] for key in sorted(counts)])
     return lat_ref, clim, annual, count_stack
 
 
-def check_raw_recompute(raw_dir: Path, target_df: pd.DataFrame | None, target_label: str) -> dict:
+def check_raw_recompute(
+    raw_dir: Path,
+    target_df: pd.DataFrame | None,
+    target_label: str,
+    ocean_mask: np.ndarray | None = None,
+    mask_source: str = "none",
+) -> dict:
     name = "data/raw 独立数值复算"
     files = list_raw_files(raw_dir)
     if not files:
@@ -546,7 +722,7 @@ def check_raw_recompute(raw_dir: Path, target_df: pd.DataFrame | None, target_la
         return make_check(name, "skip", "缺少可对齐的 zonal_mean_basins.csv（或无 global 行），跳过")
 
     try:
-        lat_raw, clim, annual, _ = recompute_zonal_from_raw(files)
+        lat_raw, clim, annual, _ = recompute_zonal_from_raw(files, ocean_mask=ocean_mask)
     except Exception as exc:  # noqa: BLE001 - 数据格式异常必须报告
         return make_check(name, "fail", f"raw 重算失败：{exc}")
 
@@ -559,6 +735,7 @@ def check_raw_recompute(raw_dir: Path, target_df: pd.DataFrame | None, target_la
 
     target = target_df.copy()
     target = target.set_index("latitude")
+    sample_months = [m for m in SAMPLE_MONTHS if f"sst_{m:02d}" in target.columns]
     rows: list[dict[str, Any]] = []
     problems: list[str] = []
     for wanted_lat in SAMPLE_LATS:
@@ -569,7 +746,7 @@ def check_raw_recompute(raw_dir: Path, target_df: pd.DataFrame | None, target_la
             lat = float(nearest)
             idx = int(np.argmin(np.abs(lat_raw - lat)))
         row = target.loc[lat]
-        for month in SAMPLE_MONTHS:
+        for month in sample_months:
             recomputed = float(clim[month - 1, idx])
             csv_value = float(row[f"sst_{month:02d}"])
             if not (np.isfinite(recomputed) and np.isfinite(csv_value)):
@@ -595,15 +772,16 @@ def check_raw_recompute(raw_dir: Path, target_df: pd.DataFrame | None, target_la
                 problems.append(f"{lat:.3f}° 年均：raw vs csv Δ={annual_diff:.4f}")
 
     max_diff = max(r["diff"] for r in rows)
-    metrics = {"n_timesteps": len(files), "target": target_label,
-               "max_abs_diff": max_diff, "samples": rows}
+    metrics = {"n_timesteps": len(files), "target": target_label, "mask_source": mask_source,
+               "months": sample_months, "max_abs_diff": max_diff, "samples": rows}
     if problems:
         return make_check(name, "fail", "；".join(problems[:8]), metrics)
+    month_text = "/".join(f"{m:02d}" for m in sample_months) if sample_months else "无月度列"
     return make_check(
         name,
         "pass",
-        f"{len(files)} 个时次独立重算，8 纬度 × 1/7 月 + 年均共 {len(rows)} 个比对，"
-        f"最大偏差 {max_diff:.4f} °C ≤ {NUMERIC_TOL}（对齐 {target_label}）",
+        f"{len(files)} 个时次独立重算，8 纬度 × {month_text} 月 + 年均共 {len(rows)} 个比对，"
+        f"最大偏差 {max_diff:.4f} °C ≤ {NUMERIC_TOL}（对齐 {target_label}；统计域 {mask_source}）",
         metrics,
     )
 
@@ -747,11 +925,16 @@ def run(data_dir: Path, raw_dir: Path, report_path: Path, skip_online: bool) -> 
         target_label = "zonal_mean_global.csv"
 
     real_ready = global_csv.exists() or basins_csv.exists() or grid_npz.exists()
+    ocean_mask, mask_source = load_ocean_mask(data_dir) if real_ready else (None, "none")
     if real_ready:
+        if mask_source != "none":
+            print(f"统计域掩膜：{mask_source}（剔除内陆湖泊/陆地）", flush=True)
+        else:
+            print("未找到 basin_mask，raw 重算与网格比对将使用全部有效格点（可能含内陆湖泊）。", flush=True)
         checks = [
             check_global_zonal(global_csv),
             check_basins_zonal(basins_csv, global_df),
-            check_grid(grid_npz, global_df),
+            check_grid(grid_npz, global_df, ocean_mask),
         ]
     else:
         # 真实数据尚未产出：结构性检查按"跳过"处理，而不是判失败
@@ -762,7 +945,7 @@ def run(data_dir: Path, raw_dir: Path, report_path: Path, skip_online: bool) -> 
             make_check("climatology_grid.npz 一致性", "skip", f"真实数据未就绪：缺少 {grid_npz}"),
         ]
     checks += [
-        check_raw_recompute(raw_dir, target_df, target_label),
+        check_raw_recompute(raw_dir, target_df, target_label, ocean_mask, mask_source),
         check_online(raw_dir, skip_online),
         check_indian_regression(INDIAN_CSV),
     ]

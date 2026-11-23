@@ -315,7 +315,15 @@ def load_summary_means(path: Path) -> dict[str, float]:
     basins = data.get("basins") if isinstance(data, dict) else None
     if not isinstance(basins, dict):
         return {}
-    keys = ("mean_sst_cos_weighted", "mean_sst", "sst_mean", "basin_mean", "annual_mean", "mean")
+    keys = (
+        "mean_sst_cos_weighted",
+        "area_weighted_annual_sst",
+        "mean_sst",
+        "sst_mean",
+        "basin_mean",
+        "annual_mean",
+        "mean",
+    )
     out: dict[str, float] = {}
     for name, info in basins.items():
         value = None
@@ -408,12 +416,16 @@ def plot_global_profile(ctx: dict, cov_min: float) -> Path:
     ]
     valid_values: list[np.ndarray] = []
     for col, label, color, lw, ls, zorder in series:
+        if col not in df:  # 月度列按需：缺 1/7 月也能画年均
+            continue
         values = df[col].to_numpy(dtype=float)
         masked = np.where(usable & np.isfinite(values), values, np.nan)
         valid_values.append(masked)
         ax.plot(masked, lat, color=color, lw=lw, ls=ls, label=label, zorder=zorder)
 
-    stacked = np.concatenate(valid_values)
+    stacked = np.concatenate(valid_values) if valid_values else np.array([])
+    if not np.isfinite(stacked).any():
+        raise SystemExit("zonal_mean_global.csv 缺少可绘制的 SST 列")
     ax.set_xlim(np.floor(np.nanmin(stacked)) - 0.8, np.ceil(np.nanmax(stacked)) + 1.4)
     ax.set_ylim(LAT_MIN - 1.0, LAT_MAX + 1.0)
 
@@ -583,6 +595,7 @@ def plot_map(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
         lat = npz["lat"].astype(float)
         lon = npz["lon"].astype(float)
         annual = npz["sst_annual"].astype(float)
+        grid_mask = npz["basin_mask"].astype(float) if "basin_mask" in npz.files else None
     if annual.shape != (len(lat), len(lon)):
         raise SystemExit(f"climatology_grid.npz 形状异常：{annual.shape} vs lat×lon")
 
@@ -608,6 +621,9 @@ def plot_map(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
     ax.clabel(cs, fmt="25 °C", fontsize=8)
 
     boundary_note = "未叠加海盆边界（basin_mask.npz 不存在）"
+    basin_grid = None
+    levels: list[float] = []
+    label = ""
     if ctx["mask_npz"].exists():
         with np.load(ctx["mask_npz"]) as npz:
             keys = set(npz.files)
@@ -619,17 +635,17 @@ def plot_map(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
                 basin_grid = npz["basin_id"].astype(float)    # int8: -1=陆地，0..4=海盆
                 levels = [-0.5, 0.5, 1.5, 2.5, 3.5]
                 label = "basin_id"
-            else:
-                basin_grid = None
-                levels = []
-                label = ""
-        if basin_grid is not None and basin_grid.shape == annual.shape:
-            step = 4
-            ax.contour(lon[::step], lat[::step], basin_grid[::step, ::step],
-                       levels=levels, colors="0.25", linewidths=0.35, alpha=0.8)
-            boundary_note = f"细线为海盆边界与海岸线（{label}）"
-        elif basin_grid is not None:
-            boundary_note = "basin_mask.npz 形状不匹配，未画边界"
+    elif grid_mask is not None:
+        basin_grid = grid_mask
+        levels = [0.5, 1.5, 2.5, 3.5, 4.5]
+        label = "climatology_grid.npz::basin_mask"
+    if basin_grid is not None and basin_grid.shape == annual.shape:
+        step = 4
+        ax.contour(lon[::step], lat[::step], basin_grid[::step, ::step],
+                   levels=levels, colors="0.25", linewidths=0.35, alpha=0.8)
+        boundary_note = f"细线为海盆边界与海岸线（{label}）"
+    elif basin_grid is not None:
+        boundary_note = "basin_mask.npz 形状不匹配，未画边界"
 
     ax.set_xlim(0, 360)
     ax.set_ylim(LAT_MIN, LAT_MAX)
@@ -655,13 +671,17 @@ def plot_map(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
     return finalize(fig, ctx, "global_sst_map.png", dpi=180)
 
 
-def plot_heatmap(ctx: dict, cov_min: float) -> Path:
+def plot_heatmap(ctx: dict, cov_min: float) -> Path | None:
     df = pd.read_csv(ctx["global_csv"])
     lat = df["latitude"].to_numpy(dtype=float)
     ocean_frac = zonal_ocean_fraction(df)
     usable = np.isfinite(ocean_frac) & (ocean_frac >= cov_min)
-    months = np.arange(1, 13)
-    data = np.vstack([df[f"sst_{m:02d}"].to_numpy(dtype=float) for m in months])
+    month_cols = [(m, f"sst_{m:02d}") for m in range(1, 13) if f"sst_{m:02d}" in df.columns]
+    if not month_cols:
+        print("  zonal_mean_global.csv 没有 sst_01..sst_12 月度列，跳过热图。", flush=True)
+        return None
+    months = np.array([m for m, _ in month_cols])
+    data = np.vstack([df[col].to_numpy(dtype=float) for _, col in month_cols])
     masked = np.ma.masked_array(data, mask=(~np.isfinite(data)) | ~usable[None, :])
 
     fig, ax = plt.subplots(figsize=(12.4, 6.8))
@@ -678,7 +698,7 @@ def plot_heatmap(ctx: dict, cov_min: float) -> Path:
     ax.clabel(cs, fmt="25 °C", fontsize=8)
 
     ax.set_xlim(LAT_MIN - 0.125, LAT_MAX + 0.125)
-    ax.set_ylim(12.5, 0.5)
+    ax.set_ylim(float(months.max()) + 0.5, float(months.min()) - 0.5)
     ax.set_yticks(months)
     ax.set_yticklabels([f"{m} 月" for m in months])
     ax.set_xticks(np.arange(-90, 91, 30))
@@ -686,7 +706,12 @@ def plot_heatmap(ctx: dict, cov_min: float) -> Path:
     ax.set_xlabel("纬度")
     ax.set_ylabel("月份")
     subtitle = "合成数据（fixture）" if ctx["synthetic"] else "2016–2020 气候态"
-    ax.set_title(f"全球纬向平均海表温度：月份 × 纬度\n（{subtitle}，90°S–90°N，灰色 = 海洋占比 < {cov_min:.0%}）", fontsize=13)
+    month_note = "" if len(months) == 12 else f"（仅 {len(months)} 个月可用）"
+    ax.set_title(
+        f"全球纬向平均海表温度：月份 × 纬度{month_note}\n"
+        f"（{subtitle}，90°S–90°N，灰色 = 海洋占比 < {cov_min:.0%}）",
+        fontsize=13,
+    )
     ax.grid(True, ls=":", lw=0.7, alpha=0.5, color="0.4")
     ax.set_axisbelow(True)
     for spine in ax.spines.values():
@@ -695,7 +720,7 @@ def plot_heatmap(ctx: dict, cov_min: float) -> Path:
     fig.text(
         0.01,
         0.005,
-        "注：每格为该纬度圈 12 个月气候态；12 个月等权平均得年均；"
+        "注：每格为该纬度圈月度气候态（来自 CSV 的 sst_MM 列）；12 个月等权平均得年均；"
         f"海洋占比 valid/{N_LON_GLOBAL} 不足的纬度置灰，不参与曲线与结论；"
         "灰色不代表冰情，coverage 见廓线副图。",
         fontsize=8.4,
@@ -846,9 +871,12 @@ def main() -> int:
     if unknown:
         raise SystemExit(f"未知图名：{unknown}，可选 {list(FIGURES)}")
     print(f"输出目录：{ctx['out_dir']}", flush=True)
+    produced: list[Path] = []
     for key in wanted:
-        FIGURES[key](ctx, cov_min)
-    print(f"完成：{len(wanted)} 张图（模式：{ctx['mode']}）。", flush=True)
+        path = FIGURES[key](ctx, cov_min)
+        if path is not None:
+            produced.append(path)
+    print(f"完成：{len(produced)} 张图（模式：{ctx['mode']}）。", flush=True)
     return 0
 
 
