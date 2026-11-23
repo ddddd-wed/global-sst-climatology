@@ -875,7 +875,7 @@ def plot_map_regions(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
             ax,
             labels_in_bbox(float(x[0]), float(x[-1]), float(y[0]), float(y[-1]),
                            include_tier1=False, include_tier2=True, include_tier3=True,
-                           include_currents=True),
+                           include_currents=True, edge_margin=2.5),
             font_t2=11.0,
             font_t3=10.0,
         )
@@ -912,6 +912,128 @@ def plot_map_regions(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
         va="bottom",
     )
     return finalize(fig, ctx, "global_sst_map_regions.png", dpi=200)
+
+
+def plot_map_mollweide(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
+    """Mollweide 等面积投影（与 4K 等经纬图并存，不替换）。"""
+    lat, lon, annual, _mask = _load_map_data(ctx)
+    lon_m = np.where(lon > 180.0, lon - 360.0, lon)
+    order = np.argsort(lon_m)
+    lon_m = lon_m[order]
+    annual_m = annual[:, order]
+    cmap = matplotlib.colormaps["RdYlBu_r"].copy()
+    cmap.set_bad("#E6E6E6")
+    fig = plt.figure(figsize=(24.0, 12.0))
+    ax = fig.add_subplot(111, projection="mollweide")
+    fig.subplots_adjust(left=0.03, right=0.88, bottom=0.08, top=0.88)
+    mesh = ax.pcolormesh(
+        np.deg2rad(lon_m),
+        np.deg2rad(lat),
+        np.ma.masked_invalid(annual_m),
+        shading="nearest",
+        cmap=cmap,
+        vmin=-2.0,
+        vmax=32.0,
+        rasterized=True,
+    )
+    cb = fig.colorbar(mesh, ax=ax, pad=0.02, aspect=32, shrink=0.82)
+    cb.set_label("海表温度 SST（°C）", fontsize=13)
+    cb.set_ticks([-2, 4, 10, 16, 22, 28, 32])
+    ax.grid(True, color="0.55", lw=0.55, alpha=0.8)
+    ax.set_xticks(np.deg2rad([-180, -120, -60, 0, 60, 120, 180]))
+    ax.set_xticklabels(["180°W", "120°W", "60°W", "0°", "60°E", "120°E", "180°E"], fontsize=11)
+    ax.set_yticks(np.deg2rad([-60, -30, 0, 30, 60]))
+    ax.set_yticklabels(["60°S", "30°S", "0°", "30°N", "60°N"], fontsize=11)
+    cs = ax.contour(np.deg2rad(lon_m), np.deg2rad(lat), np.ma.masked_invalid(annual_m),
+                    levels=[ISOTHERM_LEVEL], colors="black", linewidths=1.1)
+    ax.clabel(cs, fmt="25 °C", fontsize=9)
+    subtitle = "合成数据（fixture）" if ctx["synthetic"] else "2016–2020 气候态"
+    ax.set_title(
+        f"全球年平均海表温度 · Mollweide 等面积投影\n"
+        f"（{subtitle}；黑色等值线 = 25 °C，灰色 = 陆地/海冰/内陆湖）",
+        fontsize=17, pad=18,
+    )
+    ax.set_facecolor("#E6E6E6")
+    fig.text(
+        0.01,
+        0.008,
+        "注：Mollweide 等面积投影，0.25° 原生格点；用于面积对比；等经纬 4K 图见 global_sst_map.png。"
+        "色标固定 −2～32 °C；里海/五大湖/拉多加湖按 basin_mask=0 剔除。",
+        fontsize=9, color="0.35", va="bottom",
+    )
+    if ctx["synthetic"]:
+        add_synthetic_watermark(fig)
+    path = ctx["out_dir"] / "global_sst_map_mollweide.png"
+    width, height, _ = save_png(fig, path, dpi=200, bbox_inches=None)
+    if width < 4800 or height < 2400:
+        raise RuntimeError(f"Mollweide 图尺寸 {width}×{height} < 4800×2400")
+    return path
+
+
+def plot_map_anomaly(ctx: dict, _cov_min: float = DEFAULT_COVERAGE_MIN) -> Path:
+    """相对同纬度海洋平均的 SST 异常（不是相对时间平均）。"""
+    lat, lon, annual, _mask = _load_map_data(ctx)
+    ref_df = pd.read_csv(ctx["global_csv"])
+    ref_lat = ref_df["latitude"].to_numpy(dtype=float)
+    ref = ref_df["sst_annual"].to_numpy(dtype=float)
+    if len(ref_lat) != len(lat) or not np.allclose(ref_lat, lat, atol=1e-6):
+        ref = np.interp(lat, ref_lat, ref)
+    anomaly = annual - ref[:, None]
+    anomaly = np.clip(anomaly, -8.0, 8.0)
+    cmap = matplotlib.colormaps["RdBu_r"].copy()
+    cmap.set_bad("#E6E6E6")
+    fig, ax = plt.subplots(figsize=(14.4, 7.2))
+    fig.subplots_adjust(left=0.045, right=0.935, bottom=0.11, top=0.90)
+    mesh = ax.imshow(
+        np.ma.masked_invalid(anomaly),
+        origin="lower",
+        extent=(0.0, 360.0, LAT_MIN, LAT_MAX),
+        aspect="auto",
+        interpolation="nearest",
+        cmap=cmap,
+        vmin=-8.0,
+        vmax=8.0,
+    )
+    cb = fig.colorbar(mesh, ax=ax, pad=0.012, aspect=28)
+    cb.set_label("SST 异常（°C）", fontsize=11)
+    cb.set_ticks([-8, -4, 0, 4, 8])
+    ax.contour(lon, lat, np.ma.masked_invalid(anomaly), levels=[0.0], colors="black", linewidths=1.3)
+    ax.set_xlim(0, 360)
+    ax.set_ylim(LAT_MIN, LAT_MAX)
+    ax.set_xticks(np.arange(0, 361, 60))
+    ax.set_xticklabels([f"{v:.0f}°" for v in np.arange(0, 361, 60)])
+    ax.set_yticks(np.arange(-90, 91, 30))
+    ax.yaxis.set_major_formatter(FuncFormatter(lat_formatter))
+    ax.set_xlabel("经度")
+    ax.set_ylabel("纬度")
+    _draw_map_labels(
+        ax,
+        labels_in_bbox(0.0, 360.0, LAT_MIN, LAT_MAX, include_tier1=True, include_tier2=False,
+                       include_tier3=False, include_currents=False),
+        font_t1=16.0,
+    )
+    subtitle = "合成数据（fixture）" if ctx["synthetic"] else "2016–2020 气候态"
+    ax.set_title(
+        f"全球年平均 SST 异常（SST − 同纬度海洋平均）\n"
+        f"（{subtitle}；黑色零线；色标 ±8 °C，超出截断；灰色 = 陆地/海冰/内陆湖）",
+        fontsize=13,
+    )
+    ax.set_facecolor("#E6E6E6")
+    fig.text(
+        0.01,
+        0.005,
+        "注：异常 = 该格点年均 SST − 同纬度有效海洋格点的算术平均，**不是相对时间平均**；"
+        "色标对称 ±8 °C，超出部分截断；0.25°≈28 km 为数据分辨率上限。",
+        fontsize=8.4, color="0.35", va="bottom",
+    )
+    if ctx["synthetic"]:
+        add_synthetic_watermark(fig)
+    path = ctx["out_dir"] / "global_sst_anomaly.png"
+    width, height, _ = save_png(fig, path, dpi=400, bbox_inches=None)
+    expected = (5760, 2880)
+    if (width, height) != expected:
+        raise RuntimeError(f"异常图尺寸 {width}×{height} != {expected}")
+    return path
 
 
 
@@ -1095,6 +1217,8 @@ FIGURES = {
     "basins": plot_basins,
     "map": plot_map,
     "regions": plot_map_regions,
+    "mollweide": plot_map_mollweide,
+    "anomaly": plot_map_anomaly,
     "heatmap": plot_heatmap,
     "indian": plot_indian_vs_global,
 }
@@ -1106,7 +1230,7 @@ def main() -> int:
                         help="绘图覆盖率阈值（默认 0.10）")
     parser.add_argument("--fixture", action="store_true", help="强制使用 .tmp/fixture 合成数据")
     parser.add_argument("--refresh-fixture", action="store_true", help="重新生成合成 fixture")
-    parser.add_argument("--figures", default="", help="只画指定图，逗号分隔：profile,basins,map,regions,heatmap,indian")
+    parser.add_argument("--figures", default="", help="只画指定图，逗号分隔：profile,basins,map,regions,mollweide,anomaly,heatmap,indian")
     args = parser.parse_args()
 
     cov_min = float(args.coverage_min)

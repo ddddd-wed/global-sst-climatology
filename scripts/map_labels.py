@@ -54,7 +54,7 @@ CURRENT_LABELS = [
     ("湾流", 296.0, 37.0, "warm"),
     ("秘鲁寒流", 278.0, -16.0, "cold"),
     ("南极绕极流", 110.0, -53.0, "cold"),
-    ("本格拉寒流", 10.0, -24.0, "cold"),
+    ("本格拉寒流", 17.0, -24.0, "cold"),
 ]
 
 
@@ -73,14 +73,21 @@ def labels_in_bbox(
     include_tier2: bool = True,
     include_tier3: bool = True,
     include_currents: bool = True,
+    edge_margin: float = 0.0,
 ) -> list[dict]:
-    """返回落在视口/区域内的标注，lon 已按跨 0° 区域转换为连续坐标。"""
+    """返回落在视口/区域内的标注，lon 已按跨 0° 区域转换为连续坐标。
+
+    ``edge_margin`` > 0 时，距视口四边小于该角度（度）的标注不返回，避免字被裁半截。
+    """
     out: list[dict] = []
 
     def add(name, lon, lat, kind, tier):
         x = _display_lon(float(lon), lon_min, lon_max)
-        if lon_min - 1e-6 <= x <= lon_max + 1e-6 and lat_min - 1e-6 <= lat <= lat_max + 1e-6:
-            out.append({"name": name, "lon": x, "lat": float(lat), "kind": kind, "tier": tier})
+        if not (lon_min + edge_margin - 1e-6 <= x <= lon_max - edge_margin + 1e-6):
+            return
+        if not (lat_min + edge_margin - 1e-6 <= lat <= lat_max - edge_margin + 1e-6):
+            return
+        out.append({"name": name, "lon": x, "lat": float(lat), "kind": kind, "tier": tier})
 
     if include_tier1:
         for name, lon, lat, tier, style in OCEAN_LABELS:

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """全球版一键复现：下载 → 计算 → 绘图 → 独立复核 → 验收。
 
@@ -11,7 +11,7 @@
     python scripts/run_all.py --jobs 8
 
 任一步骤非零退出立即停止。验收口径为全球版：720 行 × 32 列、6 个海盆、720×1440 网格、
-6 张正式静态图、summary 字段与 verify.py 6 项无失败（ERDDAP 在线抽样不可用时可跳过并打印说明）；
+8 张正式静态图、summary 字段与 verify.py 6 项无失败（ERDDAP 在线抽样不可用时可跳过并打印说明）；
 并打印旧印度洋回归三项数值。
 """
 
@@ -58,6 +58,8 @@ FIGURES = [
     "basins_sst_vs_latitude.png",
     "global_sst_map.png",
     "global_sst_map_regions.png",
+    "global_sst_map_mollweide.png",
+    "global_sst_anomaly.png",
     "lat_month_heatmap.png",
     "indian_vs_global.png",
 ]
@@ -216,7 +218,7 @@ def main() -> int:
         "compute.py",
         ["--region", "global", "--raw-dir", str(raw_dir)],
     )
-    timings["绘图"] = run_step("绘制 6 张正式图", "plot.py")
+    timings["绘图"] = run_step("绘制 8 张正式图", "plot.py")
     timings["交互图"] = run_step("生成可缩放交互地图（HTML）", "make_map_viewer.py")
     timings["复核"] = run_step(
         "独立复核（60 时次 raw + ERDDAP 在线抽样）",
