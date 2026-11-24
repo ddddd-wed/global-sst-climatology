@@ -1,0 +1,13 @@
+# 统一行尾，避免 Windows 上 core.autocrlf=true 时 Python 写出的 LF 文件被反复标记为已修改
+* text=auto
+
+*.py    text eol=lf
+*.md    text eol=lf
+*.csv   text eol=lf
+*.json  text eol=lf
+*.txt   text eol=lf
+
+# 二进制产物不做行尾转换
+*.png   binary
+*.npz   binary
+*.gz    binary
