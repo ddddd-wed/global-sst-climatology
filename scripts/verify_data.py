@@ -367,7 +367,7 @@ def check_summary_json() -> dict:
 
     pipe = data["pipeline"]
     assert pipe.get("ice_raw_files_count") == 60
-    assert "anomaly_grid_npz_mb" in pipe and "compute_v2_seconds" in pipe
+    assert "anomaly_grid_npz_mb" in pipe and "npz_mb" in pipe
     print(f"[4] summary_metrics.json 校验通过（{len(data['basins'])} 分区含 icefree 子对象与双口径对照）")
     return data
 

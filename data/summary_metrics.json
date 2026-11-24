@@ -672,8 +672,6 @@
     "ice_raw_files_count": 60,
     "ice_raw_gz_mb": 168.63,
     "ice_raw_uncompressed_mb": 2748.22,
-    "compute_seconds": 26.94,
-    "compute_v2_seconds": 26.94,
     "basin_mask_npz_mb": 0.039,
     "npz_mb": 5.0,
     "anomaly_grid_npz_mb": 11.25,

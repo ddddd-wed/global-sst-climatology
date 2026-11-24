@@ -1042,8 +1042,6 @@ def run_global(raw_dir: Path, ice_dir: Path, global_csv_out: Path) -> int:
             "ice_raw_files_count": len(ice_files),
             "ice_raw_gz_mb": round(ice_raw_gz_bytes / 1e6, 2),
             "ice_raw_uncompressed_mb": round(ice_raw_csv_bytes / 1e6, 2),
-            "compute_seconds": compute_seconds,
-            "compute_v2_seconds": compute_seconds,
             "basin_mask_npz_mb": round(mask_npz_mb, 3),
             "npz_mb": round(npz_mb, 2),
             "anomaly_grid_npz_mb": round(anomaly_npz_mb, 2),
@@ -1055,7 +1053,13 @@ def run_global(raw_dir: Path, ice_dir: Path, global_csv_out: Path) -> int:
         "checkpoints": checkpoints,
     }
     SUMMARY_JSON.write_text(json.dumps(summary_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"已写出 {SUMMARY_JSON}（计算耗时 {compute_seconds:.2f}s）", flush=True)
+    timing_path = ROOT / ".tmp" / "compute_timing.json"
+    timing_path.parent.mkdir(parents=True, exist_ok=True)
+    timing_path.write_text(
+        json.dumps({"compute_seconds": compute_seconds}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"已写出 {SUMMARY_JSON}（计算耗时 {compute_seconds:.2f}s，耗时记录在 {timing_path}）", flush=True)
 
     print("\n全球与五大洋年均 SST 双口径摘要（all_ocean vs ice_free < 0.15）：")
     for k in BASIN_ORDER:
