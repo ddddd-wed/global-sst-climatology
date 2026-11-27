@@ -655,8 +655,8 @@ def save_npz_if_changed(path: Path, arrays: dict[str, np.ndarray]) -> tuple[floa
 
 
 def check_indian_regression_if_available() -> bool | None:
-    """若本地存在印度洋原始缓存（含主工作区 D:/PythonProject1/data/raw），执行逐字节回归比对。"""
-    candidates = [RAW_DIR, Path("D:/PythonProject1/data/raw")]
+    """若本地存在印度洋原始缓存，执行逐字节回归比对。"""
+    candidates = [RAW_DIR]
     indian_raw = next((p for p in candidates if p.exists() and any(p.glob("sst_*.csv*"))), None)
     if indian_raw is None or not ZONAL_CSV.exists():
         return None

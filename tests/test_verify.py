@@ -3,7 +3,7 @@
 
 运行::
 
-    D:/PythonProject1/.venv/Scripts/python.exe -m unittest discover -s tests -v
+    python -m unittest discover -s tests -v
 """
 
 from __future__ import annotations

@@ -14,7 +14,7 @@ figures/*.png.tmp
 # IDE
 .idea/workspace.xml
 
-# ±¾µØ»º´æ£¨É³Ïä»·¾³£©
+# æœ¬åœ°ç¼“å­˜ï¼ˆæ²™ç®±çŽ¯å¢ƒï¼‰
 .mplconfig/
 .uv-cache/
 .tmp/

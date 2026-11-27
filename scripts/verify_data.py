@@ -4,7 +4,7 @@
 
 用法：
     python scripts/verify_data.py
-    python scripts/verify_data.py --raw-dir D:/PythonProject1/data/raw_global --indian-raw-dir D:/PythonProject1/data/raw
+    python scripts/verify_data.py --raw-dir data/raw_global --indian-raw-dir data/raw
 """
 
 from __future__ import annotations
@@ -102,8 +102,6 @@ def check_raw_sst_and_ice(sst_raw_dir: Path | None, ice_raw_dir: Path | None) ->
         "sst_*.csv.gz",
         [
             GLOBAL_RAW_DIR,
-            Path("D:/PythonProject1/data/raw_global"),
-            Path("C:/Users/Lenovo/orca/workspaces/PythonProject1/global-ocean-sst-audit/data/raw_global"),
         ],
     )
     ice_dir = _resolve_raw_dir(ice_raw_dir, "ice_*.csv.gz", [GLOBAL_ICE_RAW_DIR])
@@ -373,10 +371,10 @@ def check_summary_json() -> dict:
 
 
 def check_indian_regression(indian_raw_dir: Path | None) -> bool:
-    candidates = [indian_raw_dir, RAW_DIR, Path("D:/PythonProject1/data/raw")]
+    candidates = [indian_raw_dir, RAW_DIR]
     src = next((p for p in candidates if p is not None and p.exists() and any(p.glob("sst_*.csv*"))), None)
     if src is None:
-        raise SystemExit("未找到印度洋原始缓存目录（data/raw 或 D:/PythonProject1/data/raw），请通过 --indian-raw-dir 指定")
+        raise SystemExit("未找到印度洋原始缓存目录（data/raw），请通过 --indian-raw-dir 指定")
 
     git_show = subprocess.run(
         ["git", "show", "7a4485d:data/zonal_mean.csv"],
